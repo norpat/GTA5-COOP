@@ -27,6 +27,18 @@ up to 7 **Guests** join and appear as extra characters in the host's world (and 
 4. Run the relay: `python coop/gta5_server.py 27530` on a PC or server both players can reach (UDP + HTTP on port 27530).
 5. Start with `Start_GTA5_Coop.bat` on both PCs.
 
+## Networking: do I need a domain / tunnel?
+No. The relay server (`coop/gta5_server.py`) just needs to be reachable by every player:
+
+| Setup | What to put in `config.json` | Notes |
+|---|---|---|
+| **Same home network (LAN)** | `server` = the relay PC's local IP (e.g. `192.168.1.50`) | Fastest. Direct UDP, no domain or tunnel needed. |
+| **Over the internet with a VPN** (Tailscale, ZeroTier, …) | `server` = the relay's VPN IP | Recommended for friends: everyone joins the same virtual LAN, nothing is opened to the internet. |
+| **Over the internet with port forwarding** | `server` = your public IP or a dynamic-DNS name | Forward UDP+TCP **27530** on your router to the relay PC. Your public IP may change. |
+| **Over the internet through an HTTPS tunnel** | `tunnel_url` = `https://<your-tunnel-host>/gta5` | Optional fallback (e.g. Cloudflare Tunnel or a reverse proxy in front of the relay's HTTP port). Slower than UDP; used automatically in *Auto (LAN + Tunnel)* mode only when UDP gets no answer. |
+
+The GUI's transport setting **Auto (LAN + Tunnel)** always tries direct UDP first and only falls back to the tunnel if UDP fails.
+
 ## Files
 | Path | |
 |---|---|

@@ -8,6 +8,7 @@ using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -109,6 +110,141 @@ public class CoopBridge : Script
     private int _lastAimTaskMs;
     private int _lastWorldSendMs;
     private int _strayCsSinceMs = 0;
+    // ===== v0.9.2: opptil 8 spillere (meg + 7 medspillere) =====
+    // All «medspiller»-tilstand (figur, bil, mål, animasjon …) ligger i feltene under. Hver medspiller har sin egen kopi
+    // (PeerCtx); SwitchTo(id) lagrer gjeldende og laster den valgte, så den eksisterende én-medspiller-koden kjøres per spiller.
+    private const int MAX_PEERS = 7;
+    private int _meleeCheckedStart = 0;
+    private int _lastPeerErrMs = 0;
+    private int _enterFrame = -1;
+    private class PeerCtx { public string Id; public object[] V; }
+    private Dictionary<string, PeerCtx> _peers = new Dictionary<string, PeerCtx>();
+    private PeerCtx _curPeer = null;
+    private static readonly string[] PEER_FIELDS = new string[] { "_guestPed", "_guestVeh", "_guestVehCreatedByUs", "_guestVehModel", "_guestModelName", "_lastAppliedOutfit", "_lastAppliedWeapon", "_targetPos", "_targetHeading", "_targetSpeed", "_targetWeapon", "_targetOutfit", "_targetAiming", "_targetShooting", "_wasAiming", "_targetAimPos", "_lastAimSentPos", "_targetVehModel", "_targetVehPos", "_targetVehHeading", "_targetVehQx", "_targetVehQy", "_targetVehQz", "_targetVehQw", "_targetVehVel", "_targetVehSteer", "_targetVehFlags", "_targetJumping", "_targetRagdoll", "_targetStealth", "_targetReloading", "_targetPedFlags", "_targetVehHostId", "_wasJumping", "_wasReloading", "_wasInCover", "_lastCoverMask", "_wasClimbing", "_wasPeerMoving", "_wasMelee", "_wasEnteringVeh", "_lastMeleeTaskMs", "_lastEnterTaskMs", "_leavingVehUntilMs", "_peerRelGroup", "_peerRelGroupInit", "_lastPvpHitSentMs", "_targetPeerHp", "_punchAlt", "_lastShootTaskMs", "_targetVehSeat", "_targetVehC1", "_targetVehC2", "_lastShotMs", "_lastAimTaskMs", "_hasTarget", "_lastRxMs", "_lastMoveTaskMs", "_lastPeerVehRxMs", "_meleeCheckedStart" };
+    private FieldInfo[] _peerFi;
+    private object[] _peerDefaults;
+    private int _iPed = -1, _iVeh = -1, _iPos = -1, _iHas = -1, _iRx = -1;
+
+    private void InitPeerContexts()
+    {
+        _peerFi = new FieldInfo[PEER_FIELDS.Length];
+        _peerDefaults = new object[PEER_FIELDS.Length];
+        for (int i = 0; i < PEER_FIELDS.Length; i++)
+        {
+            _peerFi[i] = typeof(CoopBridge).GetField(PEER_FIELDS[i], BindingFlags.NonPublic | BindingFlags.Instance);
+            if (_peerFi[i] == null) { SendRaw("ERR|peer_field_missing|" + PEER_FIELDS[i]); continue; }
+            _peerDefaults[i] = _peerFi[i].GetValue(this);
+            if (PEER_FIELDS[i] == "_guestPed") _iPed = i;
+            else if (PEER_FIELDS[i] == "_guestVeh") _iVeh = i;
+            else if (PEER_FIELDS[i] == "_targetPos") _iPos = i;
+            else if (PEER_FIELDS[i] == "_hasTarget") _iHas = i;
+            else if (PEER_FIELDS[i] == "_lastRxMs") _iRx = i;
+        }
+    }
+
+    private void SavePeer(PeerCtx c)
+    {
+        for (int i = 0; i < _peerFi.Length; i++) if (_peerFi[i] != null) c.V[i] = _peerFi[i].GetValue(this);
+    }
+
+    private void LoadPeer(PeerCtx c)
+    {
+        for (int i = 0; i < _peerFi.Length; i++) if (_peerFi[i] != null) _peerFi[i].SetValue(this, c.V[i]);
+    }
+
+    // Bytt til medspiller id (lager ny ved behov). Returnerer false hvis det allerede er 7 medspillere.
+    private bool SwitchTo(string id)
+    {
+        if (_curPeer != null && _curPeer.Id == id) return true;
+        PeerCtx target;
+        if (!_peers.TryGetValue(id, out target))
+        {
+            if (_peers.Count >= MAX_PEERS) return false;
+            target = new PeerCtx();
+            target.Id = id;
+            target.V = (object[])_peerDefaults.Clone();
+            _peers[id] = target;
+            SendRaw("EVENT|peer_joined|" + id);
+        }
+        if (_curPeer != null && _peers.ContainsKey(_curPeer.Id)) SavePeer(_curPeer);
+        _curPeer = target;
+        LoadPeer(target);
+        return true;
+    }
+
+    // Etter løkka: «hovedmedspilleren» lastes (hos gjesten verten, ellers den sist hørte), så resten av koden virker som før.
+    private void SwitchToPrimary()
+    {
+        PeerCtx best = null;
+        int bestRx = int.MinValue;
+        foreach (PeerCtx c in _peers.Values)
+        {
+            if (c.Id.StartsWith("H:")) { best = c; break; }
+            int rx = (_curPeer == c) ? _lastRxMs : (int)c.V[_iRx];
+            if (rx > bestRx) { bestRx = rx; best = c; }
+        }
+        if (best != null) SwitchTo(best.Id);
+    }
+
+    private string PeerName()
+    {
+        if (_curPeer == null) return "";
+        return _curPeer.Id.StartsWith("H:") ? _curPeer.Id.Substring(2) : _curPeer.Id;
+    }
+
+    private Ped PeerPedOf(PeerCtx c) { return (_curPeer == c) ? _guestPed : (Ped)c.V[_iPed]; }
+    private Vehicle PeerVehOf(PeerCtx c) { return (_curPeer == c) ? _guestVeh : (Vehicle)c.V[_iVeh]; }
+
+    private bool IsPeerPed(Ped p)
+    {
+        if (p == null) return false;
+        if (p == _guestPed) return true;
+        foreach (PeerCtx c in _peers.Values) { Ped q = PeerPedOf(c); if (q != null && q == p) return true; }
+        return false;
+    }
+
+    private bool IsPeerVeh(Vehicle v)
+    {
+        if (v == null) return false;
+        if (v == _guestVeh) return true;
+        foreach (PeerCtx c in _peers.Values) { Vehicle q = PeerVehOf(c); if (q != null && q == v) return true; }
+        return false;
+    }
+
+    private void SetPeersVisible(bool vis)
+    {
+        foreach (PeerCtx c in _peers.Values)
+        {
+            Ped q = PeerPedOf(c);
+            try { if (q != null && q.Exists() && q.IsVisible != vis) q.IsVisible = vis; } catch { }
+        }
+    }
+
+    // Korteste avstand fra pos til en medspiller som er hørt fra siste 8 s (float.MaxValue hvis ingen)
+    private float MinPeerDist(Vector3 pos)
+    {
+        float best = float.MaxValue;
+        foreach (PeerCtx c in _peers.Values)
+        {
+            bool has = (_curPeer == c) ? _hasTarget : (bool)c.V[_iHas];
+            int rx = (_curPeer == c) ? _lastRxMs : (int)c.V[_iRx];
+            if (!has || Game.GameTime - rx > 8000) continue;
+            Vector3 tp = (_curPeer == c) ? _targetPos : (Vector3)c.V[_iPos];
+            best = Math.Min(best, pos.DistanceTo(tp));
+        }
+        return best;
+    }
+
+    private void CleanupAllPeers()
+    {
+        foreach (string id in new List<string>(_peers.Keys))
+        {
+            SwitchTo(id);
+            CleanupGuest();
+        }
+        _peers.Clear();
+        _curPeer = null;
+    }
     public static bool Idle = false;             // v0.9.2: IDLE|1 = modden gjør ingenting (feilsøking)
     private int _myMeleeStartMs = 0;             // v0.9.2: slag som hendelser
     private bool _myMeleeHeavy = false;
@@ -217,6 +353,7 @@ public class CoopBridge : Script
 
     public CoopBridge()
     {
+        InitPeerContexts();   // v0.9.2: må skje mens medspiller-feltene har standardverdier
         Tick += OnTick;
         Aborted += OnAborted;
         Interval = 16; // ~60 Hz
@@ -250,7 +387,7 @@ public class CoopBridge : Script
         {
             StopGuestCutscene(Vector3.Zero, 0f);
         }
-        CleanupGuest();
+        CleanupAllPeers();
         CleanupHostCam();
         CleanupSyncedNpcs();
         CleanupSyncedVehs();
@@ -475,11 +612,11 @@ public class CoopBridge : Script
         else if (cmd == "SYNC" && parts.Length >= 2)
         {
             _syncEnabled = (parts[1] == "1");
-            if (!_syncEnabled) CleanupGuest();
+            if (!_syncEnabled) CleanupAllPeers();
         }
         else if (cmd == "DESPAWN")
         {
-            CleanupGuest();
+            CleanupAllPeers();
         }
         else if (cmd == "SELF_MODEL" && parts.Length >= 2)
         {
@@ -498,6 +635,17 @@ public class CoopBridge : Script
         }
         else if (cmd == "PEER" && parts.Length >= 6)
         {
+            // v0.9.2: PEER|@id|… (flere spillere). Uten id = én medspiller (eldre GUI).
+            string pid = "peer";
+            if (parts[1].StartsWith("@"))
+            {
+                pid = parts[1].Substring(1);
+                string[] np2 = new string[parts.Length - 1];
+                np2[0] = parts[0];
+                Array.Copy(parts, 2, np2, 1, parts.Length - 2);
+                parts = np2;
+            }
+            if (!SwitchTo(pid)) return;
             // PEER|model|x|y|z|heading|speed|weaponHash|outfit|aiming|shooting|aimX|aimY|aimZ
             string mdl = parts[1];
             float x, y, z, h;
@@ -611,7 +759,7 @@ public class CoopBridge : Script
                 Ped[] near = World.GetNearbyPeds(kp, 4.5f);
                 foreach (Ped np in near)
                 {
-                    if (np != null && np.Exists() && np != me && np != _guestPed && np.IsAlive && np.Model.Hash == mh)
+                    if (np != null && np.Exists() && np != me && !IsPeerPed(np) && np.IsAlive && np.Model.Hash == mh)
                     {
                         np.Kill();
                         break;
@@ -672,6 +820,7 @@ public class CoopBridge : Script
         }
         else if (cmd == "PEER_MELEE" && parts.Length >= 2)
         {
+            if (parts.Length >= 3 && parts[2].StartsWith("@") && !SwitchTo(parts[2].Substring(1))) return;
             // v0.9.2: medspilleren slo akkurat nå – spill samme slag med en gang (lett/tungt)
             if (_guestPed != null && _guestPed.Exists() && !_guestPed.IsInVehicle())
             {
@@ -682,6 +831,7 @@ public class CoopBridge : Script
         }
         else if (cmd == "SYNC_VDMG" && parts.Length >= 2)
         {
+            if (parts.Length >= 3 && parts[2].StartsWith("@") && !SwitchTo(parts[2].Substring(1))) return;
             HandleVehicleDamage(parts[1]);
         }
         else if (cmd == "SYNC_VEHS" && parts.Length >= 2)
@@ -701,8 +851,13 @@ public class CoopBridge : Script
                 Ped me = Game.Player.Character;
                 if (me != null && me.Exists() && me.IsAlive)
                 {
-                    bool alreadyHitByBullet = (_guestPed != null && _guestPed.Exists()
-                        && Function.Call<bool>(Hash.HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY, me.Handle, _guestPed.Handle, true));
+                    bool alreadyHitByBullet = false;
+                    foreach (PeerCtx hc in _peers.Values)
+                    {
+                        Ped hp = PeerPedOf(hc);
+                        if (hp != null && hp.Exists() && Function.Call<bool>(Hash.HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY, me.Handle, hp.Handle, true))
+                            alreadyHitByBullet = true;
+                    }
                     if (alreadyHitByBullet)
                     {
                         Function.Call(Hash.CLEAR_ENTITY_LAST_DAMAGE_ENTITY, me.Handle);
@@ -1337,7 +1492,7 @@ public class CoopBridge : Script
                     float farthestD = -1f;
                     foreach (KeyValuePair<int, Vehicle> ekv in _syncedVehs)
                     {
-                        if (ekv.Value != null && ekv.Value.Exists() && ekv.Value != _guestVeh && !me.IsInVehicle(ekv.Value))
+                        if (ekv.Value != null && ekv.Value.Exists() && !IsPeerVeh(ekv.Value) && !me.IsInVehicle(ekv.Value))
                         {
                             float fd = ekv.Value.Position.DistanceTo(me.Position);
                             if (fd > farthestD) { farthestD = fd; farthestId = ekv.Key; }
@@ -1361,7 +1516,7 @@ public class CoopBridge : Script
                 {
                     foreach (Vehicle lv in World.GetNearbyVehicles(vpos, 5.0f))
                     {
-                        if (lv != null && lv.Exists() && lv.Model.Hash == mHash && !_syncedVehs.ContainsValue(lv) && lv != _guestVeh)
+                        if (lv != null && lv.Exists() && lv.Model.Hash == mHash && !_syncedVehs.ContainsValue(lv) && !IsPeerVeh(lv))
                         {
                             adopt = lv;
                             break;
@@ -1458,7 +1613,7 @@ public class CoopBridge : Script
         Ped existingSeat = sv.GetPedOnSeat(seatEnum);
         if (existingSeat != null && existingSeat.Exists())
         {
-            if (existingSeat == me || existingSeat == _guestPed || _syncedNpcs.ContainsValue(existingSeat))
+            if (existingSeat == me || IsPeerPed(existingSeat) || _syncedNpcs.ContainsValue(existingSeat))
             {
                 return; // Setet brukes av spiller eller oppdrags-NPC
             }
@@ -1509,7 +1664,7 @@ public class CoopBridge : Script
         Ped me = null;
         try { me = Game.Player.Character; } catch { }
         if (_syncedVehs.TryGetValue(vId, out dv) && dv != null && dv.Exists()
-            && dv != _guestVeh && (me == null || !me.IsInVehicle(dv)))
+            && !IsPeerVeh(dv) && (me == null || !me.IsInVehicle(dv)))
         {
             try { dv.Delete(); } catch { }
         }
@@ -1530,7 +1685,7 @@ public class CoopBridge : Script
             Vehicle sv = kv.Value;
             VehTarget vt;
             // Hvis dette er bilen vi eller motspilleren bruker akkurat nå, styrer PEER-kanalen (40 Hz) den eksklusivt og den skal ALDRI slettes som stale!
-            if (sv != null && sv.Exists() && (sv == _guestVeh || (me != null && me.IsInVehicle(sv))))
+            if (sv != null && sv.Exists() && (IsPeerVeh(sv) || (me != null && me.IsInVehicle(sv))))
             {
                 if (_vehTargets.TryGetValue(vId, out vt))
                 {
@@ -1737,7 +1892,7 @@ public class CoopBridge : Script
             {
                 foreach (Ped cand in nearOnce)
                 {
-                    if (cand != null && cand.Exists() && cand != me && cand != _guestPed && cand != np
+                    if (cand != null && cand.Exists() && cand != me && !IsPeerPed(cand) && cand != np
                         && !cand.IsPlayer && !usedLocalHandles.Contains(cand.Handle)
                         && !_hiddenLocalNpcs.ContainsKey(cand.Handle) && cand.Model.Hash == mHash
                         && cand.Position.DistanceTo(tpos) < 24.0f)
@@ -1778,7 +1933,7 @@ public class CoopBridge : Script
                                 if (!spawnInVeh.IsSeatFree((VehicleSeat)st))
                                 {
                                     Ped oldCrew = spawnInVeh.GetPedOnSeat((VehicleSeat)st);
-                                    if (oldCrew != null && oldCrew != me && oldCrew != _guestPed && !_syncedNpcs.ContainsValue(oldCrew))
+                                    if (oldCrew != null && oldCrew != me && !IsPeerPed(oldCrew) && !_syncedNpcs.ContainsValue(oldCrew))
                                     {
                                         try { oldCrew.Delete(); } catch { }
                                     }
@@ -1858,7 +2013,7 @@ public class CoopBridge : Script
         {
             foreach (Ped ex in nearOnce)
             {
-                if (ex != null && ex.Exists() && ex != me && ex != _guestPed && !ex.IsPlayer
+                if (ex != null && ex.Exists() && ex != me && !IsPeerPed(ex) && !ex.IsPlayer
                     && !usedLocalHandles.Contains(ex.Handle) && !_hiddenLocalNpcs.ContainsKey(ex.Handle)
                     && ex.Position.DistanceTo(_targetPos) < 18.0f)
                 {
@@ -2135,13 +2290,13 @@ public class CoopBridge : Script
             Vehicle v = vcands[i];
             int drvMdl = 0, passMdl = 0;
             Ped drv = v.GetPedOnSeat(VehicleSeat.Driver);
-            if (drv != null && drv.Exists() && drv != me && drv != _guestPed && !drv.IsPlayer
+            if (drv != null && drv.Exists() && drv != me && !IsPeerPed(drv) && !drv.IsPlayer
                 && !Function.Call<bool>(Hash.IS_ENTITY_A_MISSION_ENTITY, drv.Handle))
             {
                 drvMdl = drv.Model.Hash;
             }
             Ped pas = v.GetPedOnSeat(VehicleSeat.Passenger);
-            if (pas != null && pas.Exists() && pas != me && pas != _guestPed && !pas.IsPlayer
+            if (pas != null && pas.Exists() && pas != me && !IsPeerPed(pas) && !pas.IsPlayer
                 && !Function.Call<bool>(Hash.IS_ENTITY_A_MISSION_ENTITY, pas.Handle))
             {
                 passMdl = pas.Model.Hash;
@@ -2378,7 +2533,7 @@ public class CoopBridge : Script
             {
                 if (v == null || !v.Exists()) continue;
                 if (vc >= 5) break;
-                string vtag = (v == _guestVeh) ? "PEERVEH" : (_syncedVehs.ContainsValue(v) ? "MIRRORVEH" : "LOCALVEH");
+                string vtag = IsPeerVeh(v) ? "PEERVEH" : (_syncedVehs.ContainsValue(v) ? "MIRRORVEH" : "LOCALVEH");
                 Ped d0 = v.GetPedOnSeat(VehicleSeat.Driver);
                 Ped p0 = v.GetPedOnSeat(VehicleSeat.Passenger);
                 Ped r1 = v.GetPedOnSeat(VehicleSeat.LeftRear);
@@ -2504,7 +2659,7 @@ public class CoopBridge : Script
             {
                 if (v == null || !v.Exists() || v == mine) continue;
                 Ped drv = v.GetPedOnSeat(VehicleSeat.Driver);
-                if (drv != null && drv.Exists() && drv == _guestPed) continue;   // medspilleren kjører -> han eier den
+                if (drv != null && drv.Exists() && IsPeerPed(drv)) continue;   // en medspiller kjører -> han eier den
                 owned.Add(new KeyValuePair<int, Vehicle>(v.Handle, v));
                 if (++n >= 10) break;   // v0.9.2: var 25
             }
@@ -2683,10 +2838,7 @@ public class CoopBridge : Script
             // Fjern alle co-op speil-NPC-er og speil-biler midlertidig + skjul Gjestens egen ped og motspiller-ped -> 0 % doble karakterer!
             CleanupSyncedNpcs();
             CleanupSyncedVehs();
-            if (_guestPed != null && _guestPed.Exists())
-            {
-                _guestPed.IsVisible = false;
-            }
+            SetPeersVisible(false);   // v0.9.2: alle medspillere
             Ped me = Game.Player.Character;
             if (me != null && me.Exists())
             {
@@ -2756,10 +2908,7 @@ public class CoopBridge : Script
                 me.IsPositionFrozen = false;
             }
         }
-        if (_guestPed != null && _guestPed.Exists())
-        {
-            _guestPed.IsVisible = true;
-        }
+        SetPeersVisible(true);   // v0.9.2: alle medspillere
         if (wasActive)
         {
             SendRaw("EVENT|guest_cutscene_stopped");
@@ -2772,7 +2921,7 @@ public class CoopBridge : Script
 
         // Hold co-op-figurer 100 % skjult mens 1:1 cutscenen pågår -> 0 % duplikater i rommet!
         if (me != null && me.Exists() && me.IsVisible) me.IsVisible = false;
-        if (_guestPed != null && _guestPed.Exists() && _guestPed.IsVisible) _guestPed.IsVisible = false;
+        SetPeersVisible(false);   // v0.9.2: alle medspillere
         Function.Call(Hash.SET_LOCAL_PLAYER_VISIBLE_IN_CUTSCENE, false, false);
 
         if (_guestCsState == 1)
@@ -3021,7 +3170,7 @@ public class CoopBridge : Script
                 Vehicle[] allLocalVehs = World.GetAllVehicles();
                 foreach (Vehicle lv in allLocalVehs)
                 {
-                    if (lv != null && lv.Exists() && lv != _guestVeh && !syncedVehHandles.Contains(lv.Handle)
+                    if (lv != null && lv.Exists() && !IsPeerVeh(lv) && !syncedVehHandles.Contains(lv.Handle)
                         && !me.IsInVehicle(lv) && !Function.Call<bool>(Hash.IS_ENTITY_A_MISSION_ENTITY, lv.Handle))
                     {
                         try { lv.Delete(); } catch { }
@@ -3035,7 +3184,7 @@ public class CoopBridge : Script
                 Ped[] allLocalPeds = World.GetAllPeds();
                 foreach (Ped lp in allLocalPeds)
                 {
-                    if (lp != null && lp.Exists() && lp != me && lp != _guestPed && !lp.IsPlayer
+                    if (lp != null && lp.Exists() && lp != me && !IsPeerPed(lp) && !lp.IsPlayer
                         && !validPedHandles.Contains(lp.Handle) && !_hiddenLocalNpcs.ContainsKey(lp.Handle)
                         && !Function.Call<bool>(Hash.IS_ENTITY_A_MISSION_ENTITY, lp.Handle))
                     {
@@ -3166,631 +3315,655 @@ public class CoopBridge : Script
             }
         }
 
-        // v0.9.2: Ved motspillerens bil: spillets egen «gå inn i bil» (F) sperres HVER frame, ellers rakk spillet å starte sin
-        // egen kapring (dra ut sjåføren) i samme frame som vi sjekket tasten -> verten ble kastet ut hos gjesten, men satt fortsatt
-        // i bilen hos verten. Vi sender i stedet spilleren til første ledige passasjersete. Andre biler (NPC) virker som vanlig.
-        if (_guestPed != null && _guestPed.Exists())
+        // ===== v0.9.2: kjøres én gang PER medspiller (opptil 7) =====
+        foreach (PeerCtx __pc in new List<PeerCtx>(_peers.Values))
         {
-            Function.Call(Hash.SET_PED_CAN_BE_DRAGGED_OUT, _guestPed.Handle, false);
-        }
-        if (!me.IsInVehicle() && _targetVehModel != 0 && _guestVeh != null && _guestVeh.Exists()
-            && me.Position.DistanceTo(_guestVeh.Position) < 9.0f)
-        {
-            Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, 23, true);   // INPUT_ENTER
-            Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, 75, true);   // INPUT_VEH_EXIT (samme tast)
-            if (Function.Call<bool>(Hash.IS_DISABLED_CONTROL_JUST_PRESSED, 0, 23)
-                && !Function.Call<bool>(Hash.IS_PED_GETTING_INTO_A_VEHICLE, me.Handle))
+            if (!SwitchTo(__pc.Id)) continue;
+            try
             {
-                int freeSeat = -2;
-                int peerSeat = _targetVehSeat;
-                if (peerSeat != -1 && _guestVeh.IsSeatFree(VehicleSeat.Driver)) freeSeat = -1;   // verten er passasjer -> vi kjører
-                else if (peerSeat != 0 && _guestVeh.IsSeatFree(VehicleSeat.Passenger)) freeSeat = 0;
-                else if (peerSeat != 1 && _guestVeh.IsSeatFree(VehicleSeat.LeftRear)) freeSeat = 1;
-                else if (peerSeat != 2 && _guestVeh.IsSeatFree(VehicleSeat.RightRear)) freeSeat = 2;
-                if (freeSeat != -2)
+                // v0.9.2: Ved motspillerens bil: spillets egen «gå inn i bil» (F) sperres HVER frame, ellers rakk spillet å starte sin
+                // egen kapring (dra ut sjåføren) i samme frame som vi sjekket tasten -> verten ble kastet ut hos gjesten, men satt fortsatt
+                // i bilen hos verten. Vi sender i stedet spilleren til første ledige passasjersete. Andre biler (NPC) virker som vanlig.
+                if (_guestPed != null && _guestPed.Exists())
                 {
-                    Function.Call(Hash.SET_VEHICLE_DOORS_LOCKED, _guestVeh.Handle, 1);
-                    Function.Call(Hash.TASK_ENTER_VEHICLE, me.Handle, _guestVeh.Handle, 5000, freeSeat, 2.0f, 1, 0);
-                    SendRaw("EVENT|enter_peer_vehicle|seat=" + freeSeat);
+                    Function.Call(Hash.SET_PED_CAN_BE_DRAGGED_OUT, _guestPed.Handle, false);
                 }
-            }
-        }
-
-        // Oppdater motspillerens ped (synlighet, klær, våpen, ekte gå-/løpe-bevegelse)
-        if (_guestPed != null && _guestPed.Exists())
-        {
-            if (_syncEnabled && _hasTarget)
-            {
-                if (Game.GameTime - _lastRxMs > 10000)
+                if (!me.IsInVehicle() && _targetVehModel != 0 && _guestVeh != null && _guestVeh.Exists()
+                    && me.Position.DistanceTo(_guestVeh.Position) < 9.0f)
                 {
-                    CleanupGuest();
+                    Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, 23, true);   // INPUT_ENTER
+                    Function.Call(Hash.DISABLE_CONTROL_ACTION, 0, 75, true);   // INPUT_VEH_EXIT (samme tast)
+                    if (Function.Call<bool>(Hash.IS_DISABLED_CONTROL_JUST_PRESSED, 0, 23)
+                        && !Function.Call<bool>(Hash.IS_PED_GETTING_INTO_A_VEHICLE, me.Handle)
+                        && _enterFrame != Function.Call<int>(Hash.GET_FRAME_COUNT))
+                    {
+                        int freeSeat = -2;
+                        int peerSeat = _targetVehSeat;
+                        if (peerSeat != -1 && _guestVeh.IsSeatFree(VehicleSeat.Driver)) freeSeat = -1;   // verten er passasjer -> vi kjører
+                        else if (peerSeat != 0 && _guestVeh.IsSeatFree(VehicleSeat.Passenger)) freeSeat = 0;
+                        else if (peerSeat != 1 && _guestVeh.IsSeatFree(VehicleSeat.LeftRear)) freeSeat = 1;
+                        else if (peerSeat != 2 && _guestVeh.IsSeatFree(VehicleSeat.RightRear)) freeSeat = 2;
+                        if (freeSeat != -2)
+                        {
+                            Function.Call(Hash.SET_VEHICLE_DOORS_LOCKED, _guestVeh.Handle, 1);
+                            _enterFrame = Function.Call<int>(Hash.GET_FRAME_COUNT);
+                            Function.Call(Hash.TASK_ENTER_VEHICLE, me.Handle, _guestVeh.Handle, 5000, freeSeat, 2.0f, 1, 0);
+                            SendRaw("EVENT|enter_peer_vehicle|seat=" + freeSeat);
+                        }
+                    }
                 }
-                else
+
+                // Oppdater motspillerens ped (synlighet, klær, våpen, ekte gå-/løpe-bevegelse)
+                if (_guestPed != null && _guestPed.Exists())
                 {
-                    _guestPed.IsVisible = (_guestCsState == 0);
-                    Function.Call(Hash.REQUEST_COLLISION_AT_COORD, _targetPos.X, _targetPos.Y, _targetPos.Z);
-                    if (_targetVehModel == 0 && !Function.Call<bool>(Hash.HAS_COLLISION_LOADED_AROUND_ENTITY, _guestPed.Handle))
+                    if (_syncEnabled && _hasTarget)
                     {
-                        // Kollisjonsvakt på motspiller: aldri fall gjennom bakken før terrenget er lastet!
-                        _guestPed.IsPositionFrozen = true;
-                        _guestPed.PositionNoOffset = _targetPos;
-                    }
-                    else
-                    {
-                        _guestPed.IsPositionFrozen = false;
-                    }
-
-                    // Klær-synk
-                    if (!string.IsNullOrEmpty(_targetOutfit) && _targetOutfit != _lastAppliedOutfit)
-                    {
-                        ApplyOutfit(_guestPed, _targetOutfit);
-                        _lastAppliedOutfit = _targetOutfit;
-                    }
-
-                    // Våpen-synk (også tilbake til Unarmed/knyttnever når motspilleren tar bort våpenet for å slåss!)
-                    uint wantWp = _targetWeapon == 0 ? (uint)WeaponHash.Unarmed : _targetWeapon;
-                    if (wantWp != _lastAppliedWeapon)
-                    {
-                        if (wantWp != (uint)WeaponHash.Unarmed)
+                        if (Game.GameTime - _lastRxMs > 10000)
                         {
-                            Function.Call(Hash.GIVE_WEAPON_TO_PED, _guestPed.Handle, wantWp, 999, false, true);
-                        }
-                        Function.Call(Hash.SET_CURRENT_PED_WEAPON, _guestPed.Handle, wantWp, true);
-                        _lastAppliedWeapon = wantWp;
-                    }
-
-                    // Null-lagg PvP treff-deteksjon (ingen NPC-knockout eller RESURRECT-stutter!):
-                    // 1) Slag / nærkamp mot medspiller (innen 2.2 m foran oss når vi faktisk trykker slag/angrep)
-                    uint myCurWp = 0;
-                    try { myCurWp = (uint)me.Weapons.Current.Hash; } catch { }
-                    bool myHasFirearm = (myCurWp != 0 && myCurWp != (uint)WeaponHash.Unarmed
-                        && myCurWp != (uint)WeaponHash.Knife && myCurWp != (uint)WeaponHash.Bat
-                        && myCurWp != (uint)WeaponHash.Crowbar && myCurWp != (uint)WeaponHash.Nightstick
-                        && myCurWp != (uint)WeaponHash.Hammer && myCurWp != (uint)WeaponHash.GolfClub
-                        && myCurWp != (uint)WeaponHash.Dagger && myCurWp != (uint)WeaponHash.Hatchet
-                        && myCurWp != (uint)WeaponHash.Machete && myCurWp != (uint)WeaponHash.SwitchBlade);
-                    bool myMeleeClick = (!myHasFirearm && Game.IsControlPressed(Control.Attack))
-                        || Game.IsControlPressed(Control.MeleeAttackLight)
-                        || Game.IsControlPressed(Control.MeleeAttackHeavy)
-                        || Game.IsControlPressed(Control.MeleeAttackAlternate);
-                    // v0.9.2: slag som HENDELSER. Start = knappen nettopp trykket eller spillet starter et slag (IS_PED_PERFORMING_MELEE_ACTION).
-                    // Medspilleren får MELEE|lett/tungt straks, og treffet sjekkes ~0.22 s inn i slaget (når neven treffer).
-                    bool performingMelee = Function.Call<bool>(Hash.IS_PED_PERFORMING_MELEE_ACTION, me.Handle);
-                    bool meleeJust = Game.IsControlJustPressed(Control.MeleeAttackLight) || Game.IsControlJustPressed(Control.MeleeAttackHeavy)
-                        || Game.IsControlJustPressed(Control.MeleeAttackAlternate) || (!myHasFirearm && Game.IsControlJustPressed(Control.Attack))
-                        || (performingMelee && !_wasPerformingMelee);
-                    _wasPerformingMelee = performingMelee;
-                    if (!me.IsInVehicle() && meleeJust && Game.GameTime - _myMeleeStartMs >= 300)
-                    {
-                        _myMeleeStartMs = Game.GameTime;
-                        _myMeleeHeavy = Game.IsControlPressed(Control.MeleeAttackHeavy) || Game.IsControlPressed(Control.MeleeAttackAlternate);
-                        _myMeleeHitChecked = false;
-                        SendRaw("MELEE|" + (_myMeleeHeavy ? 1 : 0));
-                    }
-                    if (!_myMeleeHitChecked && Game.GameTime - _myMeleeStartMs >= 220)
-                    {
-                        _myMeleeHitChecked = true;
-                        Vector3 toG = _guestPed.Position - me.Position;
-                        float d2g = (float)Math.Sqrt(toG.X * toG.X + toG.Y * toG.Y);
-                        if (d2g <= 2.0f && Math.Abs(toG.Z) <= 1.6f)
-                        {
-                            float angToG = (float)(Math.Atan2(-toG.X, toG.Y) * (180.0 / Math.PI));
-                            if (angToG < 0f) angToG += 360f;
-                            if (Math.Abs(AngleDiff(me.Heading, angToG)) <= 65.0f)
-                            {
-                                _lastPvpHitSentMs = Game.GameTime;
-                                bool unarmed = (myCurWp == 0 || myCurWp == (uint)WeaponHash.Unarmed);
-                                int mDmg = unarmed ? (_myMeleeHeavy ? 25 : 15) : 35;
-                                SendRaw("PVP_HIT|" + mDmg + "|" + (_myMeleeHeavy || !unarmed ? "heavy" : "light"));
-                                // Vis treffet lokalt også: tungt slag slår medspillerens figur kort i bakken her
-                                if (_myMeleeHeavy || !unarmed)
-                                    Function.Call(Hash.SET_PED_TO_RAGDOLL, _guestPed.Handle, 700, 900, 0, false, false, false);
-                            }
-                        }
-                    }
-                    // 2) Skudd mot medspiller (sjekker om vi sikter rett på motspilleren når skuddet avfyres)
-                    if (myHasFirearm && (me.IsShooting || Function.Call<bool>(Hash.IS_PED_SHOOTING, me.Handle))
-                             && Game.GameTime - _lastPvpHitSentMs >= 140)
-                    {
-                        bool hitPeer = Function.Call<bool>(Hash.IS_PLAYER_FREE_AIMING_AT_ENTITY, Game.Player.Handle, _guestPed.Handle);
-                        if (!hitPeer)
-                        {
-                            Vector3 camP = GameplayCamera.Position;
-                            Vector3 camD = GameplayCamera.Direction;
-                            Vector3 toCenter = (_guestPed.Position + new Vector3(0f, 0f, 0.25f)) - camP;
-                            float proj = Vector3.Dot(toCenter, camD);
-                            if (proj > 0.5f && proj < 95.0f)
-                            {
-                                Vector3 closest = camP + camD * proj;
-                                if (closest.DistanceTo(_guestPed.Position + new Vector3(0f, 0f, 0.25f)) < 0.70f)
-                                {
-                                    hitPeer = true;
-                                }
-                            }
-                        }
-                        if (hitPeer)
-                        {
-                            _lastPvpHitSentMs = Game.GameTime;
-                            SendRaw("PVP_HIT|24");
-                        }
-                    }
-                    // 3) Påkjørsel med bil i fart
-                    else if (me.IsInVehicle() && me.CurrentVehicle != null && me.CurrentVehicle.Velocity.Length() > 6.0f
-                             && Game.GameTime - _lastPvpHitSentMs >= 850 && _guestPed.IsTouching(me.CurrentVehicle))
-                    {
-                        _lastPvpHitSentMs = Game.GameTime;
-                        SendRaw("PVP_HIT|35");
-                    }
-
-                    // Eksakt kjøretøy-oppslag via vHostId + 40 Hz felles kjøring + ekte inn-/utstigningsanimasjoner!
-                    bool peerEnteringVeh = (_targetPedFlags & 128) != 0;
-                    if (_targetVehModel != 0)
-                    {
-                        _leavingVehUntilMs = 0;
-                        Vehicle targetVeh = null;
-
-                        // 1) Eksakt match på Vertens bil-handle (100 % treffsikkert selv med 10 identiske biler side om side!)
-                        if (_targetVehHostId != 0)
-                        {
-                            if (_isGuestRole)
-                            {
-                                _syncedVehs.TryGetValue(_targetVehHostId, out targetVeh);
-                            }
-                            else
-                            {
-                                try { targetVeh = Entity.FromHandle(_targetVehHostId) as Vehicle; } catch { targetVeh = null; }
-                            }
-                            if (targetVeh != null && (!targetVeh.Exists() || targetVeh.Model.Hash != _targetVehModel))
-                            {
-                                targetVeh = null;
-                            }
-                        }
-
-                        // 2) Lås til vår egen bil hvis vi allerede deler samme bilmodell
-                        if (targetVeh == null && me.IsInVehicle() && me.CurrentVehicle != null && me.CurrentVehicle.Exists()
-                            && me.CurrentVehicle.Model.Hash == _targetVehModel
-                            && (me.CurrentVehicle == _guestVeh || _guestPed.IsInVehicle(me.CurrentVehicle)
-                                || me.CurrentVehicle.Position.DistanceTo(_targetVehPos) < 45.0f))
-                        {
-                            targetVeh = me.CurrentVehicle;
-                        }
-
-                        if (targetVeh != null)
-                        {
-                            if (_guestVeh != null && _guestVeh.Exists() && _guestVeh != targetVeh && _guestVehCreatedByUs)
-                            {
-                                try { _guestVeh.Delete(); } catch { }
-                            }
-                            _guestVeh = targetVeh;
-                            _guestVehCreatedByUs = false;
-                            _guestVehModel = _targetVehModel;
+                            CleanupGuest();
                         }
                         else
                         {
-                            if (_guestVeh == null || !_guestVeh.Exists() || _guestVehModel != _targetVehModel
-                                || (!_guestVehCreatedByUs && !me.IsInVehicle(_guestVeh) && _guestVeh.Position.DistanceTo(_targetVehPos) > 40.0f))
+                            _guestPed.IsVisible = (_guestCsState == 0);
+                            Function.Call(Hash.REQUEST_COLLISION_AT_COORD, _targetPos.X, _targetPos.Y, _targetPos.Z);
+                            if (_targetVehModel == 0 && !Function.Call<bool>(Hash.HAS_COLLISION_LOADED_AROUND_ENTITY, _guestPed.Handle))
                             {
-                                Vehicle reuse = null;
-                                float bestSyncD = 30.0f;
-                                foreach (Vehicle sv in _syncedVehs.Values)
-                                {
-                                    if (sv != null && sv.Exists() && sv.Model.Hash == _targetVehModel)
-                                    {
-                                        float sd = sv.Position.DistanceTo(_targetVehPos);
-                                        if (sd < bestSyncD) { bestSyncD = sd; reuse = sv; }
-                                    }
-                                }
-                                if (reuse == null)
-                                {
-                                    Vehicle[] nearLocalVehs = World.GetNearbyVehicles(_targetVehPos, 28.0f);
-                                    float bestVD = 999f;
-                                    foreach (Vehicle lv in nearLocalVehs)
-                                    {
-                                        if (lv != null && lv.Exists() && lv.Model.Hash == _targetVehModel)
-                                        {
-                                            float d = lv.Position.DistanceTo(_targetVehPos);
-                                            if (d < bestVD) { bestVD = d; reuse = lv; }
-                                        }
-                                    }
-                                }
-                                if (reuse != null)
-                                {
-                                    if (_guestVeh != null && _guestVeh.Exists() && _guestVeh != reuse && _guestVehCreatedByUs)
-                                    {
-                                        try { _guestVeh.Delete(); } catch { }
-                                    }
-                                    _guestVeh = reuse;
-                                    _guestVehCreatedByUs = false;
-                                    _guestVehModel = _targetVehModel;
-                                }
-                                else if (_targetVehSeat == -1 && !peerEnteringVeh)
-                                {
-                                    if (_guestVeh != null && _guestVeh.Exists() && _guestVehCreatedByUs)
-                                    {
-                                        try { _guestVeh.Delete(); } catch { }
-                                    }
-                                    Model vm = new Model(_targetVehModel);
-                                    if (vm.IsValid)
-                                    {
-                                        if (!vm.IsLoaded)
-                                        {
-                                            vm.Request();
-                                        }
-                                        else
-                                        {
-                                            _guestVeh = World.CreateVehicle(vm, _targetVehPos, _targetVehHeading);
-                                            vm.MarkAsNoLongerNeeded();
-                                            if (_guestVeh != null && _guestVeh.Exists())
-                                            {
-                                                _guestVehCreatedByUs = true;
-                                                _guestVeh.IsInvincible = true;
-                                                _guestVeh.IsPersistent = true;
-                                                Function.Call(Hash.SET_VEHICLE_COLOURS, _guestVeh.Handle, _targetVehC1, _targetVehC2);
-                                                _guestVehModel = _targetVehModel;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            targetVeh = _guestVeh;
-                        }
-
-                        // VIKTIG: Ligger UTENFOR if/else slik at bilfysikken alltid kjører på 40 Hz når passasjeren sitter på i samme bil!
-                        bool peerDrivesThis = !peerEnteringVeh && (_targetVehSeat == -1)
-                            && !(targetVeh != null && me.IsInVehicle(targetVeh) && me.SeatIndex == VehicleSeat.Driver);
-                        if (targetVeh != null && targetVeh.Exists() && peerDrivesThis)
-                        {
-                            if (targetVeh.IsPositionFrozen) targetVeh.IsPositionFrozen = false;
-                            Function.Call(Hash.SET_VEHICLE_DOORS_LOCKED, targetVeh.Handle, 1);
-                            Function.Call(Hash.SET_VEHICLE_ENGINE_ON, targetVeh.Handle, true, true, false);
-                            // Når vi sitter på som passasjer, deaktiver kollisjon mot speil-trafikkbiler så ingen spøkelseskollisjon dytter oss ut av kurs!
-                            if (me.IsInVehicle(targetVeh))
-                            {
-                                foreach (Vehicle sv in _syncedVehs.Values)
-                                {
-                                    if (sv != null && sv.Exists() && sv != targetVeh && sv.Position.DistanceTo(targetVeh.Position) < 20.0f)
-                                    {
-                                        Function.Call(Hash.SET_ENTITY_NO_COLLISION_ENTITY, targetVeh.Handle, sv.Handle, false);
-                                    }
-                                }
-                            }
-                            float dt = Math.Min(0.15f, Math.Max(0f, (Game.GameTime - _lastPeerVehRxMs) / 1000.0f));
-                            Vector3 predPos = _targetVehPos + _targetVehVel * (dt + 0.015f);
-                            Vector3 vc = targetVeh.Position;
-                            float vd = vc.DistanceTo(predPos);
-                            float vspd = _targetVehVel.Length();
-                            Quaternion targetQ = new Quaternion(_targetVehQx, _targetVehQy, _targetVehQz, _targetVehQw);
-                            bool validQ = (Math.Abs(_targetVehQx) + Math.Abs(_targetVehQy) + Math.Abs(_targetVehQz) + Math.Abs(_targetVehQw) > 0.01f);
-                            if (vd > 6.0f)
-                            {
-                                targetVeh.PositionNoOffset = predPos;
-                                targetVeh.Velocity = _targetVehVel;
-                                if (validQ) targetVeh.Quaternion = targetQ;
-                                else targetVeh.Heading = _targetVehHeading;
-                            }
-                            else if (vspd > 0.4f)
-                            {
-                                targetVeh.Velocity = _targetVehVel + (predPos - vc) * 8.0f;
-                                if (validQ) targetVeh.Quaternion = Quaternion.Slerp(targetVeh.Quaternion, targetQ, 0.45f);
-                                else targetVeh.Heading = LerpAngle(targetVeh.Heading, _targetVehHeading, 0.45f);
-                            }
-                            else
-                            {
-                                if (vd > 0.20f) targetVeh.PositionNoOffset = Vector3.Lerp(vc, _targetVehPos, 0.30f);
-                                targetVeh.Velocity = Vector3.Zero;
-                                if (validQ) targetVeh.Quaternion = Quaternion.Slerp(targetVeh.Quaternion, targetQ, 0.30f);
-                                else targetVeh.Heading = LerpAngle(targetVeh.Heading, _targetVehHeading, 0.30f);
-                            }
-                            targetVeh.SteeringAngle = _targetVehSteer;
-                            ApplyVehicleFlags(targetVeh, _targetVehFlags);
-                        }
-
-                        if (targetVeh != null && targetVeh.Exists())
-                        {
-                            Function.Call(Hash.SET_VEHICLE_DOORS_LOCKED, targetVeh.Handle, 1);
-                            int wantSeat = _targetVehSeat;
-                            Ped curOcc = targetVeh.GetPedOnSeat((VehicleSeat)wantSeat);
-                            if (curOcc != null && curOcc.Exists() && curOcc != _guestPed)
-                            {
-                                if (curOcc != me && !_syncedNpcs.ContainsValue(curOcc))
-                                {
-                                    // Fjern sivil speil-sjåfør/passasjer hvis motspilleren tar setet!
-                                    try { curOcc.Delete(); } catch { }
-                                }
-                                else
-                                {
-                                    if (targetVeh.IsSeatFree(VehicleSeat.Passenger)) wantSeat = 0;
-                                    else if (targetVeh.IsSeatFree(VehicleSeat.LeftRear)) wantSeat = 1;
-                                    else if (targetVeh.IsSeatFree(VehicleSeat.RightRear)) wantSeat = 2;
-                                    else if (targetVeh.IsSeatFree(VehicleSeat.Driver)) wantSeat = -1;
-                                    else wantSeat = 3;
-                                }
-                            }
-
-                            if (peerEnteringVeh)
-                            {
-                                // Ekte dør-åpning og innstigning når motspilleren er på vei inn i bilen!
-                                bool alreadyEntering = Function.Call<bool>(Hash.IS_PED_GETTING_INTO_A_VEHICLE, _guestPed.Handle);
-                                if (!_guestPed.IsInVehicle(targetVeh) && !alreadyEntering
-                                    && (!_wasEnteringVeh || Game.GameTime - _lastEnterTaskMs >= 3000))   // v0.9.2: var 1600 ms og avbrøt animasjonen
-                                {
-                                    _lastEnterTaskMs = Game.GameTime;
-                                    if (_guestPed.Position.DistanceTo(targetVeh.Position) > 7.5f)
-                                    {
-                                        _guestPed.PositionNoOffset = _targetPos;
-                                    }
-                                    Function.Call(Hash.TASK_ENTER_VEHICLE, _guestPed.Handle, targetVeh.Handle, 4500, wantSeat, 2.0f, 1, 0);
-                                }
-                            }
-                            else
-                            {
-                                // Motspilleren sitter nå ferdig inne i setet: lås til eksakt riktig sete!
-                                // v0.9.2: er figuren fortsatt midt i inn-animasjonen, la den fullføre (inntil 3 s) i stedet for å warpe
-                                bool stillEntering = Function.Call<bool>(Hash.IS_PED_GETTING_INTO_A_VEHICLE, _guestPed.Handle)
-                                    && Game.GameTime - _lastEnterTaskMs < 3000;
-                                if (!stillEntering && (!_guestPed.IsInVehicle(targetVeh) || (int)_guestPed.SeatIndex != wantSeat))
-                                {
-                                    Function.Call(Hash.TASK_WARP_PED_INTO_VEHICLE, _guestPed.Handle, targetVeh.Handle, wantSeat);
-                                }
-                                // Drive-by skyting fra bil uten AI (kun ren kule fra bilvinduet mot siktepunktet!)
-                                if (_targetShooting && _targetWeapon != 0 && Game.GameTime - _lastShotMs >= 140)
-                                {
-                                    _lastShotMs = Game.GameTime;
-                                    Vector3 dMuz = _guestPed.Position + new Vector3(0f, 0f, 0.45f) + GameplayCamera.Direction * 0.4f;
-                                    Function.Call(Hash.SHOOT_SINGLE_BULLET_BETWEEN_COORDS,
-                                        dMuz.X, dMuz.Y, dMuz.Z,
-                                        _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z,
-                                        22, true, _targetWeapon, _guestPed.Handle, true, false, -1.0f);
-                                }
-                            }
-                        }
-                        _wasEnteringVeh = peerEnteringVeh;
-                    }
-                    else
-                    {
-                        _wasEnteringVeh = false;
-                        bool targetMelee = (_targetPedFlags & 64) != 0;
-                        // Naturlig utstigning av bil (åpner døren og går ut, eller kaster seg ut i høy fart!)
-                        if (_guestPed.IsInVehicle())
-                        {
-                            if (_leavingVehUntilMs == 0)
-                            {
-                                float lvSpd = (_guestPed.CurrentVehicle != null && _guestPed.CurrentVehicle.Exists())
-                                    ? _guestPed.CurrentVehicle.Velocity.Length() : 0f;
-                                int leaveFlags = lvSpd > 7.5f ? 4160 : 0; // 4160 = rull ut i fart, 0 = åpne dør naturlig
-                                Function.Call(Hash.TASK_LEAVE_ANY_VEHICLE, _guestPed.Handle, 0, leaveFlags);
-                                _leavingVehUntilMs = Game.GameTime + 1500;
-                            }
-                            else if (Game.GameTime >= _leavingVehUntilMs)
-                            {
-                                Function.Call(Hash.TASK_LEAVE_ANY_VEHICLE, _guestPed.Handle, 0, 16);
+                                // Kollisjonsvakt på motspiller: aldri fall gjennom bakken før terrenget er lastet!
+                                _guestPed.IsPositionFrozen = true;
                                 _guestPed.PositionNoOffset = _targetPos;
-                                _leavingVehUntilMs = 0;
                             }
-                        }
-                        else
-                        {
-                            _leavingVehUntilMs = 0;
-                        }
+                            else
+                            {
+                                _guestPed.IsPositionFrozen = false;
+                            }
 
-                        if (!_guestPed.IsInVehicle())
-                        {
-                            // Deaktiver KUN ped-mot-ped kapsel-dytting når begge står helt fredelig tett på hverandre (< 0.85m),
-                            // slik at knyttnever, spark og skudd treffer med 100 % ekte fysikk når man slåss eller skyter!
-                            bool localCombat = Game.Player.IsAiming || me.IsShooting || me.IsInMeleeCombat
-                                || Game.IsControlPressed(Control.Attack)
+                            // Klær-synk
+                            if (!string.IsNullOrEmpty(_targetOutfit) && _targetOutfit != _lastAppliedOutfit)
+                            {
+                                ApplyOutfit(_guestPed, _targetOutfit);
+                                _lastAppliedOutfit = _targetOutfit;
+                            }
+
+                            // Våpen-synk (også tilbake til Unarmed/knyttnever når motspilleren tar bort våpenet for å slåss!)
+                            uint wantWp = _targetWeapon == 0 ? (uint)WeaponHash.Unarmed : _targetWeapon;
+                            if (wantWp != _lastAppliedWeapon)
+                            {
+                                if (wantWp != (uint)WeaponHash.Unarmed)
+                                {
+                                    Function.Call(Hash.GIVE_WEAPON_TO_PED, _guestPed.Handle, wantWp, 999, false, true);
+                                }
+                                Function.Call(Hash.SET_CURRENT_PED_WEAPON, _guestPed.Handle, wantWp, true);
+                                _lastAppliedWeapon = wantWp;
+                            }
+
+                            // Null-lagg PvP treff-deteksjon (ingen NPC-knockout eller RESURRECT-stutter!):
+                            // 1) Slag / nærkamp mot medspiller (innen 2.2 m foran oss når vi faktisk trykker slag/angrep)
+                            uint myCurWp = 0;
+                            try { myCurWp = (uint)me.Weapons.Current.Hash; } catch { }
+                            bool myHasFirearm = (myCurWp != 0 && myCurWp != (uint)WeaponHash.Unarmed
+                                && myCurWp != (uint)WeaponHash.Knife && myCurWp != (uint)WeaponHash.Bat
+                                && myCurWp != (uint)WeaponHash.Crowbar && myCurWp != (uint)WeaponHash.Nightstick
+                                && myCurWp != (uint)WeaponHash.Hammer && myCurWp != (uint)WeaponHash.GolfClub
+                                && myCurWp != (uint)WeaponHash.Dagger && myCurWp != (uint)WeaponHash.Hatchet
+                                && myCurWp != (uint)WeaponHash.Machete && myCurWp != (uint)WeaponHash.SwitchBlade);
+                            bool myMeleeClick = (!myHasFirearm && Game.IsControlPressed(Control.Attack))
                                 || Game.IsControlPressed(Control.MeleeAttackLight)
                                 || Game.IsControlPressed(Control.MeleeAttackHeavy)
                                 || Game.IsControlPressed(Control.MeleeAttackAlternate);
-                            bool anyCombat = localCombat || _targetAiming || _targetShooting || targetMelee;
-                            float pairDist2d = (float)Math.Sqrt(
-                                Math.Pow(me.Position.X - _guestPed.Position.X, 2) +
-                                Math.Pow(me.Position.Y - _guestPed.Position.Y, 2));
-                            if (!me.IsInVehicle() && !anyCombat && _targetSpeed < 0.25f && pairDist2d < 0.90f)
+                            // v0.9.2: slag som HENDELSER. Start = knappen nettopp trykket eller spillet starter et slag (IS_PED_PERFORMING_MELEE_ACTION).
+                            // Medspilleren får MELEE|lett/tungt straks, og treffet sjekkes ~0.22 s inn i slaget (når neven treffer).
+                            bool performingMelee = Function.Call<bool>(Hash.IS_PED_PERFORMING_MELEE_ACTION, me.Handle);
+                            bool meleeJust = Game.IsControlJustPressed(Control.MeleeAttackLight) || Game.IsControlJustPressed(Control.MeleeAttackHeavy)
+                                || Game.IsControlJustPressed(Control.MeleeAttackAlternate) || (!myHasFirearm && Game.IsControlJustPressed(Control.Attack))
+                                || (performingMelee && !_wasPerformingMelee);
+                            _wasPerformingMelee = performingMelee;
+                            if (!me.IsInVehicle() && meleeJust && Game.GameTime - _myMeleeStartMs >= 300)
                             {
-                                Function.Call(Hash.SET_ENTITY_NO_COLLISION_ENTITY, me.Handle, _guestPed.Handle, false);
-                                Function.Call(Hash.SET_ENTITY_NO_COLLISION_ENTITY, _guestPed.Handle, me.Handle, false);
+                                _myMeleeStartMs = Game.GameTime;
+                                _myMeleeHeavy = Game.IsControlPressed(Control.MeleeAttackHeavy) || Game.IsControlPressed(Control.MeleeAttackAlternate);
+                                _myMeleeHitChecked = false;
+                                SendRaw("MELEE|" + (_myMeleeHeavy ? 1 : 0));
                             }
-                        bool targetInCover = (_targetPedFlags & 1) != 0;
-                        bool targetHighCover = (_targetPedFlags & 2) != 0;
-                        bool targetCoverLeft = (_targetPedFlags & 4) != 0;
-                        bool targetAimCover = (_targetPedFlags & 8) != 0;
-                        bool targetClimbing = (_targetPedFlags & 16) != 0;
-                        bool targetDucking = (_targetPedFlags & 32) != 0;
-
-                        // Klatring / hoppe over hinder (vault/climb)
-                        if (targetClimbing && !_wasClimbing)
-                        {
-                            _guestPed.Heading = _targetHeading;
-                            Function.Call(Hash.TASK_CLIMB, _guestPed.Handle, true);
-                        }
-                        _wasClimbing = targetClimbing;
-
-                        // Hopp og Ragdoll-synk (inkl. ragdoll når motspillerens faktiske HP <= 0 mens de venter på 5s respawn!)
-                        if (_targetJumping && !_wasJumping && !targetClimbing)
-                        {
-                            Function.Call(Hash.TASK_JUMP, _guestPed.Handle, false, false, false);
-                        }
-                        _wasJumping = _targetJumping;
-                        bool wantRagdoll = _targetRagdoll || (_targetPeerHp <= 0);
-                        if (wantRagdoll && !_guestPed.IsRagdoll)
-                        {
-                            _guestPed.CanRagdoll = true;
-                            Function.Call(Hash.SET_PED_TO_RAGDOLL, _guestPed.Handle, 1200, 1200, 0, false, false, false);
-                        }
-                        else if (!wantRagdoll && _guestPed.IsRagdoll)
-                        {
-                            _guestPed.CanRagdoll = false;
-                        }
-                        // Stealth (huking) og reload-animasjon (ALDRI kall SET_PED_DUCKING på 60 Hz eller SET_PED_TO_LOAD_COVER!)
-                        bool curStl = Function.Call<bool>(Hash.GET_PED_STEALTH_MOVEMENT, _guestPed.Handle);
-                        if (curStl != _targetStealth)
-                        {
-                            Function.Call(Hash.SET_PED_STEALTH_MOVEMENT, _guestPed.Handle, _targetStealth, "DEFAULT_ACTION");
-                        }
-                        if (_targetReloading && !_wasReloading)
-                        {
-                            Function.Call(Hash.TASK_RELOAD_WEAPON, _guestPed.Handle, true);
-                        }
-                        _wasReloading = _targetReloading;
-
-                        // Hvis motspilleren nettopp gikk UT av dekning (cover), avslutt cover-animasjonen én gang
-                        if (_wasInCover && !targetInCover)
-                        {
-                            Function.Call(Hash.CLEAR_PED_TASKS, _guestPed.Handle);
-                            _lastCoverMask = -1;
-                        }
-
-                        // Sikting/skyting/cover vs vanlig gange: bruk 2D horisontal avstand (dist2d) så ulik bakkehøyde/modellhøyde ALDRI utløser evig gange!
-                        Vector3 cur = _guestPed.Position;
-                        float dxp = _targetPos.X - cur.X;
-                        float dyp = _targetPos.Y - cur.Y;
-                        float dist2d = (float)Math.Sqrt(dxp * dxp + dyp * dyp);
-                        float dzp = Math.Abs(cur.Z - _targetPos.Z);
-                        if (dist2d > 6.0f || dzp > 3.2f)
-                        {
-                            _guestPed.PositionNoOffset = _targetPos;
-                            _guestPed.Heading = _targetHeading;
-                            Function.Call(Hash.CLEAR_PED_TASKS, _guestPed.Handle);
-                            _wasPeerMoving = false;
-                            _lastCoverMask = -1;
-                        }
-                        else if (targetInCover && !_targetShooting && !_targetAiming && !targetAimCover)
-                        {
-                            // Ren animasjonsbasert Cover (0 % AI-skyting, 0 % AI-reloading, 0 % jitter!)
-                            if (dist2d > 0.25f)
+                            if (_myMeleeStartMs != 0 && _meleeCheckedStart != _myMeleeStartMs && Game.GameTime - _myMeleeStartMs >= 220)
                             {
-                                _guestPed.PositionNoOffset = new Vector3(cur.X + dxp * 0.35f, cur.Y + dyp * 0.35f, dzp > 1.3f ? _targetPos.Z : cur.Z);
-                            }
-                            if (Math.Abs(AngleDiff(_guestPed.Heading, _targetHeading)) > 4.0f)
-                            {
-                                _guestPed.Heading = LerpAngle(_guestPed.Heading, _targetHeading, 0.30f);
-                            }
-                            int covMask = (targetHighCover ? 2 : 0) | (targetCoverLeft ? 4 : 0) | (int)(_targetWeapon & 0xFFFF);
-                            if (!_wasInCover || _lastCoverMask != covMask)
-                            {
-                                _lastCoverMask = covMask;
-                                PlayCoverAnim(_guestPed, targetHighCover, targetCoverLeft, _targetWeapon);
-                            }
-                        }
-                        else if (_targetShooting)
-                        {
-                            // Ekte skyte-animasjon (munningsflamme, lyd, rekyl) + presis kule mot siktepunktet
-                            if (Game.GameTime - _lastShootTaskMs >= 260)
-                            {
-                                _lastShootTaskMs = Game.GameTime;
-                                Function.Call(Hash.TASK_SHOOT_AT_COORD, _guestPed.Handle,
-                                    _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z, 400, unchecked((int)0xC6EE6B4C));
-                            }
-                            if (_targetWeapon != 0 && Game.GameTime - _lastShotMs >= 130)
-                            {
-                                _lastShotMs = Game.GameTime;
-                                Vector3 muzzle = _guestPed.Position + new Vector3(0f, 0f, 0.55f) + _guestPed.ForwardVector * 0.6f;
-                                Function.Call(Hash.SHOOT_SINGLE_BULLET_BETWEEN_COORDS,
-                                    muzzle.X, muzzle.Y, muzzle.Z,
-                                    _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z,
-                                    25, true, _targetWeapon, _guestPed.Handle, true, false, -1.0f);
-                            }
-                        }
-                        else if (targetMelee)
-                        {
-                            // 100 % passiv slag-synk uten AI (ALDRI kall TASK_COMBAT_PED som lar GTA-AI ta over figuren!)
-                            if (dist2d > 0.35f)
-                            {
-                                _guestPed.PositionNoOffset = new Vector3(cur.X + dxp * 0.30f, cur.Y + dyp * 0.30f, dzp > 1.3f ? _targetPos.Z : cur.Z);
-                            }
-                            _guestPed.Heading = _targetHeading;
-                            // v0.9.2: slagene kommer nå som PEER_MELEE-hendelser; flagget brukes bare som reserve hvis ingen hendelse kom
-                            if (Game.GameTime - _lastMeleeTaskMs >= 900)
-                            {
-                                _lastMeleeTaskMs = Game.GameTime;
-                                PlayPassiveMeleeAnim(_guestPed, _targetWeapon);
-                            }
-                        }
-                        else if (_targetAiming)
-                        {
-                            if (dist2d > 0.45f && _targetSpeed >= 0.25f)
-                            {
-                                if (Game.GameTime - _lastAimTaskMs >= 300)
+                                _meleeCheckedStart = _myMeleeStartMs;
+                                Vector3 toG = _guestPed.Position - me.Position;
+                                float d2g = (float)Math.Sqrt(toG.X * toG.X + toG.Y * toG.Y);
+                                if (d2g <= 2.0f && Math.Abs(toG.Z) <= 1.6f)
                                 {
-                                    _lastAimTaskMs = Game.GameTime;
-                                    Function.Call(Hash.TASK_GO_TO_COORD_WHILE_AIMING_AT_COORD, _guestPed.Handle,
-                                        _targetPos.X, _targetPos.Y, _targetPos.Z,
-                                        _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z,
-                                        1.5f, false, 0.3f, 2.0f, true, 0, false, 0);
+                                    float angToG = (float)(Math.Atan2(-toG.X, toG.Y) * (180.0 / Math.PI));
+                                    if (angToG < 0f) angToG += 360f;
+                                    if (Math.Abs(AngleDiff(me.Heading, angToG)) <= 65.0f)
+                                    {
+                                        _lastPvpHitSentMs = Game.GameTime;
+                                        bool unarmed = (myCurWp == 0 || myCurWp == (uint)WeaponHash.Unarmed);
+                                        int mDmg = unarmed ? (_myMeleeHeavy ? 25 : 15) : 35;
+                                        SendRaw("PVP_HIT|" + mDmg + "|" + (_myMeleeHeavy || !unarmed ? "heavy" : "light") + "|" + PeerName());
+                                        // Vis treffet lokalt også: tungt slag slår medspillerens figur kort i bakken her
+                                        if (_myMeleeHeavy || !unarmed)
+                                            Function.Call(Hash.SET_PED_TO_RAGDOLL, _guestPed.Handle, 700, 900, 0, false, false, false);
+                                    }
                                 }
                             }
-                            else if (!_wasAiming || Game.GameTime - _lastAimTaskMs >= 3500 || _lastAimSentPos.DistanceTo(_targetAimPos) > 2.5f)
+                            // 2) Skudd mot medspiller (sjekker om vi sikter rett på motspilleren når skuddet avfyres)
+                            if (myHasFirearm && (me.IsShooting || Function.Call<bool>(Hash.IS_PED_SHOOTING, me.Handle))
+                                     && Game.GameTime - _lastPvpHitSentMs >= 140)
                             {
-                                _lastAimTaskMs = Game.GameTime;
-                                _lastAimSentPos = _targetAimPos;
-                                Function.Call(Hash.TASK_AIM_GUN_AT_COORD, _guestPed.Handle,
-                                    _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z, 5000, false, false);
-                            }
-                        }
-                        else
-                        {
-                            if (_wasAiming || _wasMelee)
-                            {
-                                Function.Call(Hash.CLEAR_PED_TASKS, _guestPed.Handle);
-                            }
-                            bool peerMoving = (_targetSpeed >= 0.25f);
-                            if (peerMoving)
-                            {
-                                _wasPeerMoving = true;
-                                float rad = _targetHeading * (float)(Math.PI / 180.0);
-                                Vector3 fwd = new Vector3(-(float)Math.Sin(rad), (float)Math.Cos(rad), 0f);
-                                // Lead-Goal brukes KUN når motspilleren faktisk går/løper!
-                                Vector3 aimTarget = _targetPos + fwd * Math.Max(1.3f, Math.Min(_targetSpeed * 0.55f, 3.0f));
-                                float moveBlend = _targetSpeed > 4.2f ? 3.0f : (_targetSpeed > 1.8f ? 2.0f : 1.0f);
-                                if (Game.GameTime - _lastMoveTaskMs >= 180)
+                                bool hitPeer = Function.Call<bool>(Hash.IS_PLAYER_FREE_AIMING_AT_ENTITY, Game.Player.Handle, _guestPed.Handle);
+                                if (!hitPeer)
                                 {
-                                    _lastMoveTaskMs = Game.GameTime;
-                                    Function.Call(Hash.TASK_GO_STRAIGHT_TO_COORD, _guestPed.Handle,
-                                        aimTarget.X, aimTarget.Y, aimTarget.Z, moveBlend, 800, _targetHeading, 0.2f);
+                                    Vector3 camP = GameplayCamera.Position;
+                                    Vector3 camD = GameplayCamera.Direction;
+                                    Vector3 toCenter = (_guestPed.Position + new Vector3(0f, 0f, 0.25f)) - camP;
+                                    float proj = Vector3.Dot(toCenter, camD);
+                                    if (proj > 0.5f && proj < 95.0f)
+                                    {
+                                        Vector3 closest = camP + camD * proj;
+                                        if (closest.DistanceTo(_guestPed.Position + new Vector3(0f, 0f, 0.25f)) < 0.70f)
+                                        {
+                                            hitPeer = true;
+                                        }
+                                    }
                                 }
-                                if (dist2d > 1.3f && dist2d <= 6.0f)
+                                if (hitPeer)
                                 {
-                                    Vector3 pv = _guestPed.Velocity;
-                                    _guestPed.Velocity = new Vector3(
-                                        fwd.X * _targetSpeed + dxp * 2.2f,
-                                        fwd.Y * _targetSpeed + dyp * 2.2f,
-                                        pv.Z);
+                                    _lastPvpHitSentMs = Game.GameTime;
+                                    SendRaw("PVP_HIT|24||" + PeerName());
                                 }
+                            }
+                            // 3) Påkjørsel med bil i fart
+                            else if (me.IsInVehicle() && me.CurrentVehicle != null && me.CurrentVehicle.Velocity.Length() > 6.0f
+                                     && Game.GameTime - _lastPvpHitSentMs >= 850 && _guestPed.IsTouching(me.CurrentVehicle))
+                            {
+                                _lastPvpHitSentMs = Game.GameTime;
+                                SendRaw("PVP_HIT|35||" + PeerName());
+                            }
+
+                            // Eksakt kjøretøy-oppslag via vHostId + 40 Hz felles kjøring + ekte inn-/utstigningsanimasjoner!
+                            bool peerEnteringVeh = (_targetPedFlags & 128) != 0;
+                            if (_targetVehModel != 0)
+                            {
+                                _leavingVehUntilMs = 0;
+                                Vehicle targetVeh = null;
+
+                                // 1) Eksakt match på Vertens bil-handle (100 % treffsikkert selv med 10 identiske biler side om side!)
+                                if (_targetVehHostId != 0)
+                                {
+                                    if (_isGuestRole)
+                                    {
+                                        _syncedVehs.TryGetValue(_targetVehHostId, out targetVeh);
+                                    }
+                                    else
+                                    {
+                                        try { targetVeh = Entity.FromHandle(_targetVehHostId) as Vehicle; } catch { targetVeh = null; }
+                                    }
+                                    if (targetVeh != null && (!targetVeh.Exists() || targetVeh.Model.Hash != _targetVehModel))
+                                    {
+                                        targetVeh = null;
+                                    }
+                                }
+
+                                // 2) Lås til vår egen bil hvis vi allerede deler samme bilmodell
+                                if (targetVeh == null && me.IsInVehicle() && me.CurrentVehicle != null && me.CurrentVehicle.Exists()
+                                    && me.CurrentVehicle.Model.Hash == _targetVehModel
+                                    && (me.CurrentVehicle == _guestVeh || _guestPed.IsInVehicle(me.CurrentVehicle)
+                                        || me.CurrentVehicle.Position.DistanceTo(_targetVehPos) < 45.0f))
+                                {
+                                    targetVeh = me.CurrentVehicle;
+                                }
+
+                                if (targetVeh != null)
+                                {
+                                    if (_guestVeh != null && _guestVeh.Exists() && _guestVeh != targetVeh && _guestVehCreatedByUs)
+                                    {
+                                        try { _guestVeh.Delete(); } catch { }
+                                    }
+                                    _guestVeh = targetVeh;
+                                    _guestVehCreatedByUs = false;
+                                    _guestVehModel = _targetVehModel;
+                                }
+                                else
+                                {
+                                    if (_guestVeh == null || !_guestVeh.Exists() || _guestVehModel != _targetVehModel
+                                        || (!_guestVehCreatedByUs && !me.IsInVehicle(_guestVeh) && _guestVeh.Position.DistanceTo(_targetVehPos) > 40.0f))
+                                    {
+                                        Vehicle reuse = null;
+                                        float bestSyncD = 30.0f;
+                                        foreach (Vehicle sv in _syncedVehs.Values)
+                                        {
+                                            if (sv != null && sv.Exists() && sv.Model.Hash == _targetVehModel)
+                                            {
+                                                float sd = sv.Position.DistanceTo(_targetVehPos);
+                                                if (sd < bestSyncD) { bestSyncD = sd; reuse = sv; }
+                                            }
+                                        }
+                                        if (reuse == null)
+                                        {
+                                            Vehicle[] nearLocalVehs = World.GetNearbyVehicles(_targetVehPos, 28.0f);
+                                            float bestVD = 999f;
+                                            foreach (Vehicle lv in nearLocalVehs)
+                                            {
+                                                if (lv != null && lv.Exists() && lv.Model.Hash == _targetVehModel)
+                                                {
+                                                    float d = lv.Position.DistanceTo(_targetVehPos);
+                                                    if (d < bestVD) { bestVD = d; reuse = lv; }
+                                                }
+                                            }
+                                        }
+                                        if (reuse != null)
+                                        {
+                                            if (_guestVeh != null && _guestVeh.Exists() && _guestVeh != reuse && _guestVehCreatedByUs)
+                                            {
+                                                try { _guestVeh.Delete(); } catch { }
+                                            }
+                                            _guestVeh = reuse;
+                                            _guestVehCreatedByUs = false;
+                                            _guestVehModel = _targetVehModel;
+                                        }
+                                        else if (_targetVehSeat == -1 && !peerEnteringVeh)
+                                        {
+                                            if (_guestVeh != null && _guestVeh.Exists() && _guestVehCreatedByUs)
+                                            {
+                                                try { _guestVeh.Delete(); } catch { }
+                                            }
+                                            Model vm = new Model(_targetVehModel);
+                                            if (vm.IsValid)
+                                            {
+                                                if (!vm.IsLoaded)
+                                                {
+                                                    vm.Request();
+                                                }
+                                                else
+                                                {
+                                                    _guestVeh = World.CreateVehicle(vm, _targetVehPos, _targetVehHeading);
+                                                    vm.MarkAsNoLongerNeeded();
+                                                    if (_guestVeh != null && _guestVeh.Exists())
+                                                    {
+                                                        _guestVehCreatedByUs = true;
+                                                        _guestVeh.IsInvincible = true;
+                                                        _guestVeh.IsPersistent = true;
+                                                        Function.Call(Hash.SET_VEHICLE_COLOURS, _guestVeh.Handle, _targetVehC1, _targetVehC2);
+                                                        _guestVehModel = _targetVehModel;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    targetVeh = _guestVeh;
+                                }
+
+                                // VIKTIG: Ligger UTENFOR if/else slik at bilfysikken alltid kjører på 40 Hz når passasjeren sitter på i samme bil!
+                                bool peerDrivesThis = !peerEnteringVeh && (_targetVehSeat == -1)
+                                    && !(targetVeh != null && me.IsInVehicle(targetVeh) && me.SeatIndex == VehicleSeat.Driver);
+                                if (targetVeh != null && targetVeh.Exists() && peerDrivesThis)
+                                {
+                                    if (targetVeh.IsPositionFrozen) targetVeh.IsPositionFrozen = false;
+                                    Function.Call(Hash.SET_VEHICLE_DOORS_LOCKED, targetVeh.Handle, 1);
+                                    Function.Call(Hash.SET_VEHICLE_ENGINE_ON, targetVeh.Handle, true, true, false);
+                                    // Når vi sitter på som passasjer, deaktiver kollisjon mot speil-trafikkbiler så ingen spøkelseskollisjon dytter oss ut av kurs!
+                                    if (me.IsInVehicle(targetVeh))
+                                    {
+                                        foreach (Vehicle sv in _syncedVehs.Values)
+                                        {
+                                            if (sv != null && sv.Exists() && sv != targetVeh && sv.Position.DistanceTo(targetVeh.Position) < 20.0f)
+                                            {
+                                                Function.Call(Hash.SET_ENTITY_NO_COLLISION_ENTITY, targetVeh.Handle, sv.Handle, false);
+                                            }
+                                        }
+                                    }
+                                    float dt = Math.Min(0.15f, Math.Max(0f, (Game.GameTime - _lastPeerVehRxMs) / 1000.0f));
+                                    Vector3 predPos = _targetVehPos + _targetVehVel * (dt + 0.015f);
+                                    Vector3 vc = targetVeh.Position;
+                                    float vd = vc.DistanceTo(predPos);
+                                    float vspd = _targetVehVel.Length();
+                                    Quaternion targetQ = new Quaternion(_targetVehQx, _targetVehQy, _targetVehQz, _targetVehQw);
+                                    bool validQ = (Math.Abs(_targetVehQx) + Math.Abs(_targetVehQy) + Math.Abs(_targetVehQz) + Math.Abs(_targetVehQw) > 0.01f);
+                                    if (vd > 6.0f)
+                                    {
+                                        targetVeh.PositionNoOffset = predPos;
+                                        targetVeh.Velocity = _targetVehVel;
+                                        if (validQ) targetVeh.Quaternion = targetQ;
+                                        else targetVeh.Heading = _targetVehHeading;
+                                    }
+                                    else if (vspd > 0.4f)
+                                    {
+                                        targetVeh.Velocity = _targetVehVel + (predPos - vc) * 8.0f;
+                                        if (validQ) targetVeh.Quaternion = Quaternion.Slerp(targetVeh.Quaternion, targetQ, 0.45f);
+                                        else targetVeh.Heading = LerpAngle(targetVeh.Heading, _targetVehHeading, 0.45f);
+                                    }
+                                    else
+                                    {
+                                        if (vd > 0.20f) targetVeh.PositionNoOffset = Vector3.Lerp(vc, _targetVehPos, 0.30f);
+                                        targetVeh.Velocity = Vector3.Zero;
+                                        if (validQ) targetVeh.Quaternion = Quaternion.Slerp(targetVeh.Quaternion, targetQ, 0.30f);
+                                        else targetVeh.Heading = LerpAngle(targetVeh.Heading, _targetVehHeading, 0.30f);
+                                    }
+                                    targetVeh.SteeringAngle = _targetVehSteer;
+                                    ApplyVehicleFlags(targetVeh, _targetVehFlags);
+                                }
+
+                                if (targetVeh != null && targetVeh.Exists())
+                                {
+                                    Function.Call(Hash.SET_VEHICLE_DOORS_LOCKED, targetVeh.Handle, 1);
+                                    int wantSeat = _targetVehSeat;
+                                    Ped curOcc = targetVeh.GetPedOnSeat((VehicleSeat)wantSeat);
+                                    if (curOcc != null && curOcc.Exists() && !IsPeerPed(curOcc))
+                                    {
+                                        if (curOcc != me && !_syncedNpcs.ContainsValue(curOcc))
+                                        {
+                                            // Fjern sivil speil-sjåfør/passasjer hvis motspilleren tar setet!
+                                            try { curOcc.Delete(); } catch { }
+                                        }
+                                        else
+                                        {
+                                            if (targetVeh.IsSeatFree(VehicleSeat.Passenger)) wantSeat = 0;
+                                            else if (targetVeh.IsSeatFree(VehicleSeat.LeftRear)) wantSeat = 1;
+                                            else if (targetVeh.IsSeatFree(VehicleSeat.RightRear)) wantSeat = 2;
+                                            else if (targetVeh.IsSeatFree(VehicleSeat.Driver)) wantSeat = -1;
+                                            else wantSeat = 3;
+                                        }
+                                    }
+
+                                    if (peerEnteringVeh)
+                                    {
+                                        // Ekte dør-åpning og innstigning når motspilleren er på vei inn i bilen!
+                                        bool alreadyEntering = Function.Call<bool>(Hash.IS_PED_GETTING_INTO_A_VEHICLE, _guestPed.Handle);
+                                        if (!_guestPed.IsInVehicle(targetVeh) && !alreadyEntering
+                                            && (!_wasEnteringVeh || Game.GameTime - _lastEnterTaskMs >= 3000))   // v0.9.2: var 1600 ms og avbrøt animasjonen
+                                        {
+                                            _lastEnterTaskMs = Game.GameTime;
+                                            if (_guestPed.Position.DistanceTo(targetVeh.Position) > 7.5f)
+                                            {
+                                                _guestPed.PositionNoOffset = _targetPos;
+                                            }
+                                            Function.Call(Hash.TASK_ENTER_VEHICLE, _guestPed.Handle, targetVeh.Handle, 4500, wantSeat, 2.0f, 1, 0);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // Motspilleren sitter nå ferdig inne i setet: lås til eksakt riktig sete!
+                                        // v0.9.2: er figuren fortsatt midt i inn-animasjonen, la den fullføre (inntil 3 s) i stedet for å warpe
+                                        bool stillEntering = Function.Call<bool>(Hash.IS_PED_GETTING_INTO_A_VEHICLE, _guestPed.Handle)
+                                            && Game.GameTime - _lastEnterTaskMs < 3000;
+                                        if (!stillEntering && (!_guestPed.IsInVehicle(targetVeh) || (int)_guestPed.SeatIndex != wantSeat))
+                                        {
+                                            Function.Call(Hash.TASK_WARP_PED_INTO_VEHICLE, _guestPed.Handle, targetVeh.Handle, wantSeat);
+                                        }
+                                        // Drive-by skyting fra bil uten AI (kun ren kule fra bilvinduet mot siktepunktet!)
+                                        if (_targetShooting && _targetWeapon != 0 && Game.GameTime - _lastShotMs >= 140)
+                                        {
+                                            _lastShotMs = Game.GameTime;
+                                            Vector3 dMuz = _guestPed.Position + new Vector3(0f, 0f, 0.45f) + GameplayCamera.Direction * 0.4f;
+                                            Function.Call(Hash.SHOOT_SINGLE_BULLET_BETWEEN_COORDS,
+                                                dMuz.X, dMuz.Y, dMuz.Z,
+                                                _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z,
+                                                22, true, _targetWeapon, _guestPed.Handle, true, false, -1.0f);
+                                        }
+                                    }
+                                }
+                                _wasEnteringVeh = peerEnteringVeh;
                             }
                             else
                             {
-                                // Motspilleren står helt i ro (_targetSpeed < 0.25f): ALDRI kall TASK_GO_STRAIGHT_TO_COORD!
-                                if (_wasPeerMoving)
+                                _wasEnteringVeh = false;
+                                bool targetMelee = (_targetPedFlags & 64) != 0;
+                                // Naturlig utstigning av bil (åpner døren og går ut, eller kaster seg ut i høy fart!)
+                                if (_guestPed.IsInVehicle())
                                 {
-                                    _wasPeerMoving = false;
+                                    if (_leavingVehUntilMs == 0)
+                                    {
+                                        float lvSpd = (_guestPed.CurrentVehicle != null && _guestPed.CurrentVehicle.Exists())
+                                            ? _guestPed.CurrentVehicle.Velocity.Length() : 0f;
+                                        int leaveFlags = lvSpd > 7.5f ? 4160 : 0; // 4160 = rull ut i fart, 0 = åpne dør naturlig
+                                        Function.Call(Hash.TASK_LEAVE_ANY_VEHICLE, _guestPed.Handle, 0, leaveFlags);
+                                        _leavingVehUntilMs = Game.GameTime + 1500;
+                                    }
+                                    else if (Game.GameTime >= _leavingVehUntilMs)
+                                    {
+                                        Function.Call(Hash.TASK_LEAVE_ANY_VEHICLE, _guestPed.Handle, 0, 16);
+                                        _guestPed.PositionNoOffset = _targetPos;
+                                        _leavingVehUntilMs = 0;
+                                    }
+                                }
+                                else
+                                {
+                                    _leavingVehUntilMs = 0;
+                                }
+
+                                if (!_guestPed.IsInVehicle())
+                                {
+                                    // Deaktiver KUN ped-mot-ped kapsel-dytting når begge står helt fredelig tett på hverandre (< 0.85m),
+                                    // slik at knyttnever, spark og skudd treffer med 100 % ekte fysikk når man slåss eller skyter!
+                                    bool localCombat = Game.Player.IsAiming || me.IsShooting || me.IsInMeleeCombat
+                                        || Game.IsControlPressed(Control.Attack)
+                                        || Game.IsControlPressed(Control.MeleeAttackLight)
+                                        || Game.IsControlPressed(Control.MeleeAttackHeavy)
+                                        || Game.IsControlPressed(Control.MeleeAttackAlternate);
+                                    bool anyCombat = localCombat || _targetAiming || _targetShooting || targetMelee;
+                                    float pairDist2d = (float)Math.Sqrt(
+                                        Math.Pow(me.Position.X - _guestPed.Position.X, 2) +
+                                        Math.Pow(me.Position.Y - _guestPed.Position.Y, 2));
+                                    if (!me.IsInVehicle() && !anyCombat && _targetSpeed < 0.25f && pairDist2d < 0.90f)
+                                    {
+                                        Function.Call(Hash.SET_ENTITY_NO_COLLISION_ENTITY, me.Handle, _guestPed.Handle, false);
+                                        Function.Call(Hash.SET_ENTITY_NO_COLLISION_ENTITY, _guestPed.Handle, me.Handle, false);
+                                    }
+                                bool targetInCover = (_targetPedFlags & 1) != 0;
+                                bool targetHighCover = (_targetPedFlags & 2) != 0;
+                                bool targetCoverLeft = (_targetPedFlags & 4) != 0;
+                                bool targetAimCover = (_targetPedFlags & 8) != 0;
+                                bool targetClimbing = (_targetPedFlags & 16) != 0;
+                                bool targetDucking = (_targetPedFlags & 32) != 0;
+
+                                // Klatring / hoppe over hinder (vault/climb)
+                                if (targetClimbing && !_wasClimbing)
+                                {
+                                    _guestPed.Heading = _targetHeading;
+                                    Function.Call(Hash.TASK_CLIMB, _guestPed.Handle, true);
+                                }
+                                _wasClimbing = targetClimbing;
+
+                                // Hopp og Ragdoll-synk (inkl. ragdoll når motspillerens faktiske HP <= 0 mens de venter på 5s respawn!)
+                                if (_targetJumping && !_wasJumping && !targetClimbing)
+                                {
+                                    Function.Call(Hash.TASK_JUMP, _guestPed.Handle, false, false, false);
+                                }
+                                _wasJumping = _targetJumping;
+                                bool wantRagdoll = _targetRagdoll || (_targetPeerHp <= 0);
+                                if (wantRagdoll && !_guestPed.IsRagdoll)
+                                {
+                                    _guestPed.CanRagdoll = true;
+                                    Function.Call(Hash.SET_PED_TO_RAGDOLL, _guestPed.Handle, 1200, 1200, 0, false, false, false);
+                                }
+                                else if (!wantRagdoll && _guestPed.IsRagdoll)
+                                {
+                                    _guestPed.CanRagdoll = false;
+                                }
+                                // Stealth (huking) og reload-animasjon (ALDRI kall SET_PED_DUCKING på 60 Hz eller SET_PED_TO_LOAD_COVER!)
+                                bool curStl = Function.Call<bool>(Hash.GET_PED_STEALTH_MOVEMENT, _guestPed.Handle);
+                                if (curStl != _targetStealth)
+                                {
+                                    Function.Call(Hash.SET_PED_STEALTH_MOVEMENT, _guestPed.Handle, _targetStealth, "DEFAULT_ACTION");
+                                }
+                                if (_targetReloading && !_wasReloading)
+                                {
+                                    Function.Call(Hash.TASK_RELOAD_WEAPON, _guestPed.Handle, true);
+                                }
+                                _wasReloading = _targetReloading;
+
+                                // Hvis motspilleren nettopp gikk UT av dekning (cover), avslutt cover-animasjonen én gang
+                                if (_wasInCover && !targetInCover)
+                                {
                                     Function.Call(Hash.CLEAR_PED_TASKS, _guestPed.Handle);
+                                    _lastCoverMask = -1;
                                 }
-                                if (dist2d > 0.28f)
+
+                                // Sikting/skyting/cover vs vanlig gange: bruk 2D horisontal avstand (dist2d) så ulik bakkehøyde/modellhøyde ALDRI utløser evig gange!
+                                Vector3 cur = _guestPed.Position;
+                                float dxp = _targetPos.X - cur.X;
+                                float dyp = _targetPos.Y - cur.Y;
+                                float dist2d = (float)Math.Sqrt(dxp * dxp + dyp * dyp);
+                                float dzp = Math.Abs(cur.Z - _targetPos.Z);
+                                if (dist2d > 6.0f || dzp > 3.2f)
                                 {
-                                    float nx = cur.X + dxp * 0.25f;
-                                    float ny = cur.Y + dyp * 0.25f;
-                                    float nz = (dzp > 1.3f) ? _targetPos.Z : cur.Z;
-                                    _guestPed.PositionNoOffset = new Vector3(nx, ny, nz);
+                                    _guestPed.PositionNoOffset = _targetPos;
+                                    _guestPed.Heading = _targetHeading;
+                                    Function.Call(Hash.CLEAR_PED_TASKS, _guestPed.Handle);
+                                    _wasPeerMoving = false;
+                                    _lastCoverMask = -1;
                                 }
-                                if (Math.Abs(AngleDiff(_guestPed.Heading, _targetHeading)) > 2.5f)
+                                else if (targetInCover && !_targetShooting && !_targetAiming && !targetAimCover)
                                 {
-                                    _guestPed.Heading = LerpAngle(_guestPed.Heading, _targetHeading, 0.25f);
+                                    // Ren animasjonsbasert Cover (0 % AI-skyting, 0 % AI-reloading, 0 % jitter!)
+                                    if (dist2d > 0.25f)
+                                    {
+                                        _guestPed.PositionNoOffset = new Vector3(cur.X + dxp * 0.35f, cur.Y + dyp * 0.35f, dzp > 1.3f ? _targetPos.Z : cur.Z);
+                                    }
+                                    if (Math.Abs(AngleDiff(_guestPed.Heading, _targetHeading)) > 4.0f)
+                                    {
+                                        _guestPed.Heading = LerpAngle(_guestPed.Heading, _targetHeading, 0.30f);
+                                    }
+                                    int covMask = (targetHighCover ? 2 : 0) | (targetCoverLeft ? 4 : 0) | (int)(_targetWeapon & 0xFFFF);
+                                    if (!_wasInCover || _lastCoverMask != covMask)
+                                    {
+                                        _lastCoverMask = covMask;
+                                        PlayCoverAnim(_guestPed, targetHighCover, targetCoverLeft, _targetWeapon);
+                                    }
+                                }
+                                else if (_targetShooting)
+                                {
+                                    // Ekte skyte-animasjon (munningsflamme, lyd, rekyl) + presis kule mot siktepunktet
+                                    if (Game.GameTime - _lastShootTaskMs >= 260)
+                                    {
+                                        _lastShootTaskMs = Game.GameTime;
+                                        Function.Call(Hash.TASK_SHOOT_AT_COORD, _guestPed.Handle,
+                                            _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z, 400, unchecked((int)0xC6EE6B4C));
+                                    }
+                                    if (_targetWeapon != 0 && Game.GameTime - _lastShotMs >= 130)
+                                    {
+                                        _lastShotMs = Game.GameTime;
+                                        Vector3 muzzle = _guestPed.Position + new Vector3(0f, 0f, 0.55f) + _guestPed.ForwardVector * 0.6f;
+                                        Function.Call(Hash.SHOOT_SINGLE_BULLET_BETWEEN_COORDS,
+                                            muzzle.X, muzzle.Y, muzzle.Z,
+                                            _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z,
+                                            25, true, _targetWeapon, _guestPed.Handle, true, false, -1.0f);
+                                    }
+                                }
+                                else if (targetMelee)
+                                {
+                                    // 100 % passiv slag-synk uten AI (ALDRI kall TASK_COMBAT_PED som lar GTA-AI ta over figuren!)
+                                    if (dist2d > 0.35f)
+                                    {
+                                        _guestPed.PositionNoOffset = new Vector3(cur.X + dxp * 0.30f, cur.Y + dyp * 0.30f, dzp > 1.3f ? _targetPos.Z : cur.Z);
+                                    }
+                                    _guestPed.Heading = _targetHeading;
+                                    // v0.9.2: slagene kommer nå som PEER_MELEE-hendelser; flagget brukes bare som reserve hvis ingen hendelse kom
+                                    if (Game.GameTime - _lastMeleeTaskMs >= 900)
+                                    {
+                                        _lastMeleeTaskMs = Game.GameTime;
+                                        PlayPassiveMeleeAnim(_guestPed, _targetWeapon);
+                                    }
+                                }
+                                else if (_targetAiming)
+                                {
+                                    if (dist2d > 0.45f && _targetSpeed >= 0.25f)
+                                    {
+                                        if (Game.GameTime - _lastAimTaskMs >= 300)
+                                        {
+                                            _lastAimTaskMs = Game.GameTime;
+                                            Function.Call(Hash.TASK_GO_TO_COORD_WHILE_AIMING_AT_COORD, _guestPed.Handle,
+                                                _targetPos.X, _targetPos.Y, _targetPos.Z,
+                                                _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z,
+                                                1.5f, false, 0.3f, 2.0f, true, 0, false, 0);
+                                        }
+                                    }
+                                    else if (!_wasAiming || Game.GameTime - _lastAimTaskMs >= 3500 || _lastAimSentPos.DistanceTo(_targetAimPos) > 2.5f)
+                                    {
+                                        _lastAimTaskMs = Game.GameTime;
+                                        _lastAimSentPos = _targetAimPos;
+                                        Function.Call(Hash.TASK_AIM_GUN_AT_COORD, _guestPed.Handle,
+                                            _targetAimPos.X, _targetAimPos.Y, _targetAimPos.Z, 5000, false, false);
+                                    }
+                                }
+                                else
+                                {
+                                    if (_wasAiming || _wasMelee)
+                                    {
+                                        Function.Call(Hash.CLEAR_PED_TASKS, _guestPed.Handle);
+                                    }
+                                    bool peerMoving = (_targetSpeed >= 0.25f);
+                                    if (peerMoving)
+                                    {
+                                        _wasPeerMoving = true;
+                                        float rad = _targetHeading * (float)(Math.PI / 180.0);
+                                        Vector3 fwd = new Vector3(-(float)Math.Sin(rad), (float)Math.Cos(rad), 0f);
+                                        // Lead-Goal brukes KUN når motspilleren faktisk går/løper!
+                                        Vector3 aimTarget = _targetPos + fwd * Math.Max(1.3f, Math.Min(_targetSpeed * 0.55f, 3.0f));
+                                        float moveBlend = _targetSpeed > 4.2f ? 3.0f : (_targetSpeed > 1.8f ? 2.0f : 1.0f);
+                                        if (Game.GameTime - _lastMoveTaskMs >= 180)
+                                        {
+                                            _lastMoveTaskMs = Game.GameTime;
+                                            Function.Call(Hash.TASK_GO_STRAIGHT_TO_COORD, _guestPed.Handle,
+                                                aimTarget.X, aimTarget.Y, aimTarget.Z, moveBlend, 800, _targetHeading, 0.2f);
+                                        }
+                                        if (dist2d > 1.3f && dist2d <= 6.0f)
+                                        {
+                                            Vector3 pv = _guestPed.Velocity;
+                                            _guestPed.Velocity = new Vector3(
+                                                fwd.X * _targetSpeed + dxp * 2.2f,
+                                                fwd.Y * _targetSpeed + dyp * 2.2f,
+                                                pv.Z);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // Motspilleren står helt i ro (_targetSpeed < 0.25f): ALDRI kall TASK_GO_STRAIGHT_TO_COORD!
+                                        if (_wasPeerMoving)
+                                        {
+                                            _wasPeerMoving = false;
+                                            Function.Call(Hash.CLEAR_PED_TASKS, _guestPed.Handle);
+                                        }
+                                        if (dist2d > 0.28f)
+                                        {
+                                            float nx = cur.X + dxp * 0.25f;
+                                            float ny = cur.Y + dyp * 0.25f;
+                                            float nz = (dzp > 1.3f) ? _targetPos.Z : cur.Z;
+                                            _guestPed.PositionNoOffset = new Vector3(nx, ny, nz);
+                                        }
+                                        if (Math.Abs(AngleDiff(_guestPed.Heading, _targetHeading)) > 2.5f)
+                                        {
+                                            _guestPed.Heading = LerpAngle(_guestPed.Heading, _targetHeading, 0.25f);
+                                        }
+                                    }
+                                }
+                                _wasAiming = (_targetShooting || _targetAiming);
+                                _wasMelee = targetMelee;
+                                if ((_targetShooting || _targetAiming || targetMelee) && _wasInCover)
+                                {
+                                    _lastCoverMask = -1;
+                                }
+                                _wasInCover = targetInCover;
                                 }
                             }
-                        }
-                        _wasAiming = (_targetShooting || _targetAiming);
-                        _wasMelee = targetMelee;
-                        if ((_targetShooting || _targetAiming || targetMelee) && _wasInCover)
-                        {
-                            _lastCoverMask = -1;
-                        }
-                        _wasInCover = targetInCover;
                         }
                     }
                 }
             }
+            catch (Exception __ex)
+            {
+                if (Game.GameTime - _lastPeerErrMs > 5000) { _lastPeerErrMs = Game.GameTime; SendRaw("ERR|peer_tick|" + __pc.Id + "|" + __ex.Message); }
+            }
+            // Medspiller borte i over 30 s: rydd og glem
+            if (Game.GameTime - _lastRxMs > 30000 && _lastRxMs != 0)
+            {
+                CleanupGuest();
+                _peers.Remove(__pc.Id);
+                _curPeer = null;
+                SendRaw("EVENT|peer_left|" + __pc.Id);
+            }
         }
+        SwitchToPrimary();
+
 
         // Les egne klær hvert 1. sekund (lett)
         if (Game.GameTime - _lastOutfitSendMs >= 1000)
@@ -3809,7 +3982,7 @@ public class CoopBridge : Script
             {
                 foreach (Ped np in near)
                 {
-                    if (np != null && np.Exists() && np != me && np != _guestPed && np.IsDead && !_reportedDead.Contains(np.Handle))
+                    if (np != null && np.Exists() && np != me && !IsPeerPed(np) && np.IsDead && !_reportedDead.Contains(np.Handle))
                     {
                         _reportedDead.Add(np.Handle);
                         Vector3 dp = np.Position;
@@ -3869,9 +4042,9 @@ public class CoopBridge : Script
             if (csPlaying)
             {
                 _hostWasInCutscene = true;
-                if (_guestPed != null && _guestPed.Exists() && _guestPed.IsVisible)   // v0.9.2: gjestens figur ikke med i vertens film
+                if (!_hostCsHidGuest)   // v0.9.2: ingen medspillere med i vertens film
                 {
-                    _guestPed.IsVisible = false;
+                    SetPeersVisible(false);
                     _hostCsHidGuest = true;
                 }
                 if (string.IsNullOrEmpty(_activeCutscene) && !_hostCsUnknownSent && _hostCsUnknownSinceMs != 0
@@ -3921,9 +4094,9 @@ public class CoopBridge : Script
             }
             else if (_hostWasInCutscene || !string.IsNullOrEmpty(_activeCutscene))
             {
-                if (_hostCsHidGuest && _guestPed != null && _guestPed.Exists())
+                if (_hostCsHidGuest)
                 {
-                    _guestPed.IsVisible = true;
+                    SetPeersVisible(true);
                 }
                 _hostCsHidGuest = false;
                 string endData = string.Format(CultureInfo.InvariantCulture, "{0:F1},{1:F1},{2:F1},{3:F1}",
@@ -3965,15 +4138,15 @@ public class CoopBridge : Script
             if (Game.GameTime - _lastVehSyncMs >= 70)
             {
                 _lastVehSyncMs = Game.GameTime;
-                bool hasPeerTarget = (_hasTarget && Game.GameTime - _lastRxMs < 8000);
+                bool hasPeerTarget = _peers.Count > 0;   // v0.9.2: alle medspillere (MinPeerDist)
                 Vehicle[] nearV = World.GetAllVehicles();
                 List<Vehicle> vcands = new List<Vehicle>(nearV.Length);
                 foreach (Vehicle v in nearV)
                 {
-                    if (v != null && v.Exists() && (v != _guestVeh || me.IsInVehicle(v)))
+                    if (v != null && v.Exists() && (!IsPeerVeh(v) || me.IsInVehicle(v)))
                     {
                         float dMin = v.Position.DistanceTo(scanCenter);
-                        if (hasPeerTarget) dMin = Math.Min(dMin, v.Position.DistanceTo(_targetPos));
+                        if (hasPeerTarget) dMin = Math.Min(dMin, MinPeerDist(v.Position));
                         if (dMin <= 500.0f) vcands.Add(v);
                     }
                 }
@@ -3994,8 +4167,8 @@ public class CoopBridge : Script
                     float db = b.Position.DistanceTo(scanCenter);
                     if (hasPeerTarget)
                     {
-                        da = Math.Min(da, a.Position.DistanceTo(_targetPos));
-                        db = Math.Min(db, b.Position.DistanceTo(_targetPos));
+                        da = Math.Min(da, MinPeerDist(a.Position));
+                        db = Math.Min(db, MinPeerDist(b.Position));
                     }
                     float sa = da - (a.Velocity.Length() > 0.8f ? 90.0f : 0f) - (IsEmergencyOrHeli(a) ? 200.0f : 0f);
                     float sb2 = db - (b.Velocity.Length() > 0.8f ? 90.0f : 0f) - (IsEmergencyOrHeli(b) ? 200.0f : 0f);
@@ -4023,7 +4196,7 @@ public class CoopBridge : Script
                 {
                     if (np == null || !np.Exists() || np == me || np == _guestPed || np.IsPlayer) continue;
                     float pdMin = np.Position.DistanceTo(scanCenter);
-                    if (hasPeerTarget) pdMin = Math.Min(pdMin, np.Position.DistanceTo(_targetPos));
+                    if (hasPeerTarget) pdMin = Math.Min(pdMin, MinPeerDist(np.Position));
                     if (pdMin > 400.0f) continue;
                     if (np.IsInVehicle() && !Function.Call<bool>(Hash.IS_ENTITY_A_MISSION_ENTITY, np.Handle))
                     {
@@ -4037,8 +4210,8 @@ public class CoopBridge : Script
                     float pb = b.Position.DistanceTo(scanCenter);
                     if (hasPeerTarget)
                     {
-                        pa = Math.Min(pa, a.Position.DistanceTo(_targetPos));
-                        pb = Math.Min(pb, b.Position.DistanceTo(_targetPos));
+                        pa = Math.Min(pa, MinPeerDist(a.Position));
+                        pb = Math.Min(pb, MinPeerDist(b.Position));
                     }
                     pa -= IsPolicePed(a) ? 180.0f : 0f;
                     pb -= IsPolicePed(b) ? 180.0f : 0f;

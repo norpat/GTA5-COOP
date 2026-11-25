@@ -1,7 +1,7 @@
 # GTA V Story Co-op (v0.9.2)
 
-Two-player co-op for **GTA V Legacy, Story Mode** on PC. One player is the **Host** and plays the story as usual;
-the other is the **Guest**, who appears as an extra character in the host's world. A small mod GUI controls everything
+Co-op for up to **8 players** in **GTA V Legacy, Story Mode** on PC. One player is the **Host** and plays the story as usual;
+up to 7 **Guests** join and appear as extra characters in the host's world (and see each other). A small mod GUI controls everything
 (no in-game menu).
 
 > Story Mode only. Never start GTA Online with this mod installed. You need your own legitimate copy of the game.

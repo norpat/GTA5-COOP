@@ -95,7 +95,7 @@ def normalize_role(r: str) -> str:
 
 def install_guest_save(log):
     r"""v0.9.2: Gjest: kopier lagringen i coop\saves\guest\ (f.eks. en 100 %-lagring) inn som gjestens autolagring
-    (SGTA50015) i GTA V-profilen (Documents\Rockstar Games\GTA V\Profiles\<id>), slik at gjesten aldri starter egne story-oppdrag. Bare før GTA V kjører.
+    (SGTA50015) i GTA V-profilen (DocumentsRockstar GamesGTA VProfiles<id>), slik at gjesten aldri starter egne story-oppdrag. Bare før GTA V kjører.
     Gjestens gamle lagring tas vare på i coop\saves\backup_<tid>\."""
     import glob
     import hashlib
@@ -925,7 +925,8 @@ class CoopApp:
                     pass
             elif cmd == "PVP_HIT" and len(parts) >= 2:
                 try:
-                    self._send_server({"t": "pvp_hit", "dmg": int(parts[1]), "k": parts[2] if len(parts) >= 3 else ""})
+                    self._send_server({"t": "pvp_hit", "dmg": int(parts[1]), "k": parts[2] if len(parts) >= 3 else "",
+                                       "to": parts[3] if len(parts) >= 4 else ""})
                 except ValueError:
                     pass
             elif cmd == "WORLD" and len(parts) >= 5:
@@ -1029,6 +1030,9 @@ class CoopApp:
         elif t == "npc_dead":
             self._send_game(f"KILL_NEAR|{msg.get('mh', 0)}|{msg.get('x', 0.0):.2f}|{msg.get('y', 0.0):.2f}|{msg.get('z', 0.0):.2f}")
         elif t == "pvp_hit":
+            to = msg.get("to") or ""
+            if to and to != (self.name_var.get().strip() or PC_NAME):
+                return   # v0.9.2: treffet gjaldt en annen spiller
             self._send_game(f"PVP_HIT|{int(msg.get('dmg', 15))}|{msg.get('k', '')}")
         elif t == "wanted_req":
             if self.role_var.get() == "Host":
@@ -1068,10 +1072,12 @@ class CoopApp:
             if self.role_var.get() == "Guest":
                 self._send_game(f"SYNC_PROPS|{msg.get('d', '')}")
         elif t == "melee":
-            self._send_game(f"PEER_MELEE|{1 if str(msg.get('k')) == '1' else 0}")
+            sid = ("H:" if msg.get("role") == "Host" else "") + str(msg.get("name", "peer"))[:24]
+            self._send_game(f"PEER_MELEE|{1 if str(msg.get('k')) == '1' else 0}|@{sid}")
         elif t == "vdmg":
             if msg.get("d"):
-                self._send_game(f"SYNC_VDMG|{msg['d']}")
+                sid = ("H:" if msg.get("role") == "Host" else "") + str(msg.get("name", "peer"))[:24]
+                self._send_game(f"SYNC_VDMG|{msg['d']}|@{sid}")
         elif t == "host_vehs":
             if self.role_var.get() == "Guest" and msg.get("d"):
                 self._send_game(f"SYNC_VEHS|{msg['d']}")
@@ -1085,7 +1091,9 @@ class CoopApp:
             st = msg.get("s")
             if isinstance(st, dict):
                 self.peer_state = st
-                if self.role_var.get() == "Host":
+                sender_is_host = (msg.get("role") == "Host")   # v0.9.2: flere spillere – modell etter avsenderens rolle
+                pid = ("H:" if sender_is_host else "") + str(msg.get("name", "peer"))[:24]
+                if not sender_is_host:
                     mdl = GUEST_MODELS.get(peer_mdl_key, "ig_lamardavis")
                 else:
                     hmh = int(st.get("mh", 0))
@@ -1096,7 +1104,7 @@ class CoopApp:
                     else:
                         mdl = "player_zero"
                 self._send_game(
-                    f"PEER|{mdl}|{st.get('x', 0.0):.3f}|{st.get('y', 0.0):.3f}|"
+                    f"PEER|@{pid}|{mdl}|{st.get('x', 0.0):.3f}|{st.get('y', 0.0):.3f}|"
                     f"{st.get('z', 0.0):.3f}|{st.get('h', 0.0):.2f}|"
                     f"{st.get('spd', 0.0):.2f}|{st.get('wp', 0)}|{st.get('outfit', '')}|"
                     f"{st.get('aim', 0)}|{st.get('shoot', 0)}|"

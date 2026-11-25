@@ -303,7 +303,7 @@ class CoopApp:
             fill=FG, font=("Segoe UI", 16, "bold"), anchor="center"
         )
         self._sub_id = self.banner.create_text(
-            360, 52, text="SEAMLESS CAMPAIGN MULTIPLAYER  ·  WORLD, TRAFFIC & POLICE SYNC",
+            360, 52, text="",
             fill=GOLD, font=("Segoe UI", 8, "bold"), anchor="center"
         )
         self.banner.bind("<Configure>", self._on_banner_resize)

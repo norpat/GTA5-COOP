@@ -95,7 +95,7 @@ def normalize_role(r: str) -> str:
 
 def install_guest_save(log):
     r"""v0.9.2: Gjest: kopier lagringen i coop\saves\guest\ (f.eks. en 100 %-lagring) inn som gjestens autolagring
-    (SGTA50015) i GTA V-profilen (DocumentsRockstar GamesGTA VProfiles<id>), slik at gjesten aldri starter egne story-oppdrag. Bare før GTA V kjører.
+    (SGTA50015) i GTA V-profilen (Documents\Rockstar Games\GTA V\Profiles\<id>), slik at gjesten aldri starter egne story-oppdrag. Bare før GTA V kjører.
     Gjestens gamle lagring tas vare på i coop\saves\backup_<tid>\."""
     import glob
     import hashlib

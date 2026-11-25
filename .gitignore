@@ -1,0 +1,9 @@
+*.dll
+*.pdb
+__pycache__/
+coop/logs/
+coop/config.json
+coop/saves/guest/SGTA5*
+coop/saves/backup_*/
+coop/reload.trigger
+mod/runtime/

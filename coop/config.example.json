@@ -1,0 +1,11 @@
+{
+  "role": "Host",
+  "name": "Player1",
+  "server": "",
+  "port": 27530,
+  "tunnel_url": "",
+  "transport": "Auto (LAN + Tunnel)",
+  "room": "Public",
+  "room_password": "",
+  "model": "Lamar"
+}
